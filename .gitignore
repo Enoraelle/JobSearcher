@@ -1,4 +1,28 @@
-# --- Project Files ---
+# --- Python ---
+venv/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.eggs/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- IDE ---
+.idea/
+*.iml
+.vscode/
+
+# --- Data & secrets ---
 .env
 *.db
 *.db-journal
@@ -6,18 +30,14 @@
 *.db-shm
 *.log
 
-# --- Python's things ---
-venv/
-env/
-.venv/
-__pycache__/
-*.py[cod]
-*$py.class
-
-# --- IDE PyCharm / JetBrains ---
-.idea/
-*.iml
-
-# --- OS Files ---
+# --- OS files ---
 .DS_Store
 Thumbs.db
+
+# --- Local configuration ---
+# Real user profile; only config.example.yaml is versioned.
+config.yaml
+
+# --- Claude Code ---
+# CLAUDE.md, .claude/settings.json, and .mcp.json are meant to be versioned.
+.claude/settings.local.json
