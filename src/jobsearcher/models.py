@@ -1,0 +1,170 @@
+"""Data models for JobSearcher (job postings, scoring, and tracking state).
+
+This module has a single implementation, so it stays a flat file rather than
+a package — see the "File vs. package" convention in CLAUDE.md.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Final
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Query parameters stripped during URL normalization because they identify a
+# traffic source rather than the job posting itself. Two URLs that only differ
+# by one of these params refer to the same posting and must normalize to the
+# same key. Edit this list, not the normalization logic, to add new ones.
+_TRACKING_PARAM_PREFIXES: Final[tuple[str, ...]] = ("utm_",)
+_TRACKING_PARAM_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "referrer",
+        "source",
+        "src",
+    }
+)
+
+
+class WorkMode(StrEnum):
+    """Work arrangement offered by a job posting."""
+
+    REMOTE = "remote"
+    HYBRID = "hybrid"
+    ONSITE = "onsite"
+    UNKNOWN = "unknown"
+
+
+class ApplicationStatus(StrEnum):
+    """Where a job posting stands in the user's application pipeline."""
+
+    NEW = "new"
+    SHORTLISTED = "shortlisted"
+    APPLIED = "applied"
+    INTERVIEWING = "interviewing"
+    REJECTED = "rejected"
+    CLOSED = "closed"
+
+
+def _is_tracking_param(name: str) -> bool:
+    """Return whether a query parameter name is a traffic-tracking param."""
+    lowered = name.lower()
+    return lowered in _TRACKING_PARAM_NAMES or lowered.startswith(_TRACKING_PARAM_PREFIXES)
+
+
+def normalize_job_url(value: str) -> str:
+    """Normalize a job posting URL into a stable, deduplication-safe key.
+
+    Applies, in order: lowercase scheme/host with http forced to https,
+    fragment removal, trailing-slash removal (except for the root path),
+    tracking-parameter removal, empty-value parameter removal, and
+    alphabetical sorting of the remaining query parameters.
+
+    Args:
+        value: The URL as received from a source.
+
+    Returns:
+        The normalized URL, suitable as a stable identity key.
+
+    Raises:
+        ValueError: If the value is not an absolute URL (missing scheme or host).
+    """
+    parts = urlsplit(value.strip())
+    if not parts.scheme or not parts.netloc:
+        raise ValueError(f"'{value}' is not an absolute URL")
+
+    scheme = "https" if parts.scheme.lower() == "http" else parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path.rstrip("/") or "/"
+
+    query_pairs = sorted(
+        (key, val)
+        for key, val in parse_qsl(parts.query, keep_blank_values=True)
+        if val and not _is_tracking_param(key)
+    )
+    query = urlencode(query_pairs)
+
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+class JobPosting(BaseModel):
+    """A single job posting collected from a source.
+
+    ``url`` is the normalized, natural identity of a posting: two postings
+    with the same normalized URL are considered the same job and must not be
+    stored twice. ``raw_url`` keeps the URL exactly as the source produced
+    it, for debugging sources that start emitting unexpected links.
+    """
+
+    # --- Identity ---
+    url: str
+    raw_url: str
+    title: str
+    company: str
+    source: str
+
+    # --- Content ---
+    description_raw: str
+    description_clean: str | None = None
+
+    # --- Metadata ---
+    location: str | None = None
+    work_mode: WorkMode = WorkMode.UNKNOWN
+    contract_type: str | None = None
+    salary_text: str | None = None
+    published_at: datetime | None = None
+    fetched_at: datetime
+
+    # --- Geography / eligibility ---
+    # Captures restrictions such as "Only candidates in India" or
+    # "Remote - US", which `location` and `work_mode` cannot express alone.
+    eligible_locations: list[str] = Field(default_factory=list)
+
+    # --- Scoring ---
+    score: int | None = Field(default=None, ge=0, le=100)
+    summary: str | None = None
+    matched_skills: list[str] = Field(default_factory=list)
+    missing_skills: list[str] = Field(default_factory=list)
+
+    # --- Application tracking ---
+    status: ApplicationStatus = ApplicationStatus.NEW
+    applied_at: datetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_raw_url_from_url(cls, data: Any) -> Any:
+        """Populate raw_url from url when a source only supplies one field."""
+        if isinstance(data, dict) and data.get("raw_url") is None and "url" in data:
+            data = {**data, "raw_url": data["url"]}
+        return data
+
+    @field_validator("url")
+    @classmethod
+    def normalize_url(cls, value: str) -> str:
+        return normalize_job_url(value)
+
+    @field_validator("title", "company", "source")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        """Reject empty or whitespace-only identity fields."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be empty")
+        return stripped
+
+    @field_validator("fetched_at", "published_at", "applied_at")
+    @classmethod
+    def ensure_utc(cls, value: datetime | None) -> datetime | None:
+        """Require timezone-aware datetimes, normalized to UTC."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("datetime must be timezone-aware")
+        return value.astimezone(UTC)

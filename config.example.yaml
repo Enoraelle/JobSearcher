@@ -1,0 +1,66 @@
+# Example JobSearcher configuration.
+#
+# Copy this file to config.yaml and fill in your own profile — config.yaml is
+# gitignored because it holds personal data, config.example.yaml is the only
+# version tracked in the repository.
+
+search:
+  title_keywords_include:
+    - "python developer"
+    - "backend engineer"
+    - "django"
+  title_keywords_exclude:
+    - "senior"
+    - "staff"
+    - "lead"
+  languages:
+    - en
+    - fr
+
+profile:
+  role: "Python/Django Backend Developer"
+  skills:
+    - python
+    - django
+    - django rest framework
+    - postgresql
+    - celery
+    - docker
+    - rest apis
+  absent_skills:
+    - php
+    - symfony
+  experience_years: 3
+  work_mode: remote
+  locations:
+    - France
+    - Remote - EU
+
+sources:
+  linkedin:
+    enabled: true
+    query: "python django developer"
+  indeed:
+    enabled: false
+  greenhouse:
+    enabled: true
+    companies:
+      - some-company
+
+storage:
+  backend: sqlite
+  path: "./jobsearcher.db"
+
+scoring:
+  backend: keyword_match
+  weight_skills: 0.6
+  weight_location: 0.2
+  weight_work_mode: 0.2
+
+exporters:
+  markdown_digest:
+    enabled: true
+    output_path: "./digest.md"
+  notion:
+    enabled: true
+    database_id: "your-notion-database-id"
