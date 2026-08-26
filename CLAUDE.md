@@ -61,6 +61,20 @@ imports.
 - **Formatting and linting.** `ruff check` and `ruff format` are the source
   of truth for style; don't hand-fight the formatter's choices.
 
+## Open questions
+
+- **Refresh strategy for already-stored postings.** `SqliteStorage.save_many`
+  ([sqlite.py](src/jobsearcher/storage/sqlite.py)) inserts with
+  `INSERT OR IGNORE` keyed on URL, so a posting already in the database is
+  never updated by a later scrape — not just its score, but also its title,
+  description, and every other field, even if the source changed them. This
+  is deliberate for v1 (see the docstring on `save_many`): it guarantees a
+  score is never silently clobbered by a rescrape. Nothing yet refreshes
+  stale non-scoring content, though. Revisit before v2 — options include a
+  separate `refresh_many`/`upsert_content` operation that updates everything
+  except score/status/summary/matched_skills/missing_skills, or a
+  content-hash check to detect and apply only real changes.
+
 ## Absolute rules
 
 - **Never run `git push`, nor any command that rewrites history**
