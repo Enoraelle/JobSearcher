@@ -1,0 +1,72 @@
+{
+  "jobs": [
+    {
+      "absolute_url": "https://boards.greenhouse.io/examplecorp/jobs/4000001",
+      "internal_job_id": 4000001,
+      "id": 4000001,
+      "updated_at": "2026-07-15T10:00:00-04:00",
+      "requisition_id": "REQ-001",
+      "title": "Senior Backend Engineer",
+      "location": {
+        "name": "Remote - US"
+      },
+      "content": "<p>We build the platform that powers our product.</p><p><strong>Requirements</strong></p><ul><li>5+ years of Python</li><li>Experience with distributed systems</li></ul><p>Only candidates in United States will be considered.</p>",
+      "departments": [
+        {
+          "id": 1,
+          "name": "Engineering"
+        }
+      ],
+      "offices": [
+        {
+          "id": 1,
+          "name": "Remote"
+        }
+      ]
+    },
+    {
+      "internal_job_id": 4000002,
+      "id": 4000002,
+      "updated_at": "2026-07-16T09:30:00-04:00",
+      "requisition_id": "REQ-002",
+      "location": {
+        "name": "Paris, France"
+      },
+      "content": "<p>Missing a title field on purpose to exercise the malformed-item path.</p>",
+      "departments": [
+        {
+          "id": 2,
+          "name": "Product"
+        }
+      ],
+      "offices": []
+    },
+    {
+      "absolute_url": "https://boards.greenhouse.io/examplecorp/jobs/4000003",
+      "internal_job_id": 4000003,
+      "id": 4000003,
+      "updated_at": "2026-07-17T14:00:00-04:00",
+      "requisition_id": "REQ-003",
+      "title": "Product Designer",
+      "location": {
+        "name": "Berlin, Germany"
+      },
+      "content": "<p>Hybrid role based in our Berlin office.</p><p>Must be based in Germany.</p>",
+      "departments": [
+        {
+          "id": 3,
+          "name": "Design"
+        }
+      ],
+      "offices": [
+        {
+          "id": 2,
+          "name": "Berlin"
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "total": 3
+  }
+}
