@@ -1,5 +1,46 @@
 # Contributing
 
+## Three shapes of source, and which to copy from
+
+Every source fetches from one of three kinds of external place, and the
+codebase has one reference example of each:
+
+| Shape                 | Reference                                                    | Stability                                                                 |
+| ---------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| JSON API                | [`sources/greenhouse.py`](src/jobsearcher/sources/greenhouse.py)       | A published contract. Fields are typed and named; a missing field is a genuine anomaly. |
+| RSS/XML feed             | [`sources/weworkremotely.py`](src/jobsearcher/sources/weworkremotely.py) | A published feed format, but not necessarily every field on every item (We Work Remotely truncates `<description>`, for instance). |
+| Scraped HTML page       | [`sources/freework.py`](src/jobsearcher/sources/freework.py)           | No contract at all. The site owes scrapers nothing and can change its markup at any time. |
+
+Pick your reference by what you're pointed at, not by how similar the target
+site "feels" to one you already know:
+
+- **The source publishes a JSON API** (even an undocumented one you found in
+  the site's network tab) → copy `greenhouse.py`. Parse the response with
+  ordinary dict/key access; a missing field is a legitimate `KeyError`
+  because the API has a shape it's supposed to honor.
+- **The source publishes an RSS/Atom feed** → copy `weworkremotely.py`.
+  Parse it with `xml.etree.ElementTree` (stdlib, no new dependency). Expect
+  feeds to under-supply content compared to the full page (see We Work
+  Remotely's truncated descriptions) more often than to omit structural
+  fields outright.
+- **The only way to get the data is scraping rendered HTML** → copy
+  `freework.py`. This is the fragile case, and it's worth reading that
+  module's docstring in full before starting: selectors live as named
+  constants at the top of the module and nowhere else, every lookup that
+  can fail returns `None` instead of raising deep inside a parse tree, and
+  a page whose selectors no longer match anything must fail with a message
+  that says outright that the site's layout has probably changed — never
+  an `AttributeError` on `None`. `freework.py` uses BeautifulSoup
+  (`beautifulsoup4`, with the stdlib `html.parser` backend — no `lxml`) for
+  real CSS-selector support; if your source also needs HTML scraping, reuse
+  that dependency rather than adding another HTML parsing library.
+
+If a source doesn't cleanly fit one shape (e.g. an HTML page that embeds a
+JSON blob in a `<script>` tag), copy whichever reference dominates the
+*failure modes* you'll need to handle — a source that can fail because its
+markup moved should follow `freework.py`'s error-message discipline even if
+most of its fields come out of embedded JSON.
+
 ## Adding a new source
 
 A source fetches postings from one external place (an API, a scraped page)
@@ -16,6 +57,7 @@ and implement its two abstract methods:
 
 ```python
 from jobsearcher.sources.base import Source, register_source
+
 
 @register_source("your_source")
 class YourSource(Source):
@@ -51,6 +93,7 @@ class YourSourceConfig(BaseModel):
     enabled: bool = True
     # ... your fields ...
 
+    
 class YourSource(Source):
     def __init__(self, name: str, config: PluginConfig, **kwargs: Any) -> None:
         super().__init__(name, config, **kwargs)
@@ -127,6 +170,7 @@ through `httpx.MockTransport` rather than mocking at a higher level:
 def handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=FIXTURE_PAYLOAD)
 
+
 client = httpx.Client(transport=httpx.MockTransport(handler))
 source = YourSource("your_source", config, client=client)
 ```
@@ -151,6 +195,12 @@ At minimum, cover:
 
 See [`tests/test_sources_greenhouse.py`](tests/test_sources_greenhouse.py)
 and [`tests/fixtures/greenhouse_jobs.json`](tests/fixtures/greenhouse_jobs.json)
-for a complete example, and
-[`tests/test_sources_base.py`](tests/test_sources_base.py) for tests that
-exercise `Source`'s shared retry/backoff/rate-limit policy directly.
+for a complete JSON API example,
+[`tests/test_sources_weworkremotely.py`](tests/test_sources_weworkremotely.py)
+and its `tests/fixtures/weworkremotely_*` files for the RSS shape,
+[`tests/test_sources_freework.py`](tests/test_sources_freework.py) and its
+`tests/fixtures/freework_*.html` files for the HTML-scraping shape
+(including a fixture that specifically exercises the "layout has probably
+changed" path), and [`tests/test_sources_base.py`](tests/test_sources_base.py)
+for tests that exercise `Source`'s shared retry/backoff/rate-limit policy
+directly.

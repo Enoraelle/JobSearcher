@@ -42,10 +42,42 @@ sources:
     query: "python django developer"
   indeed:
     enabled: false
+
+  # JSON API source (see sources/greenhouse.py). One request per configured
+  # company slug against Greenhouse's public, unauthenticated Job Board API.
   greenhouse:
     enabled: true
     companies:
       - some-company
+
+  # RSS feed source (see sources/weworkremotely.py). "remote-jobs" is the
+  # site-wide feed; any other entry is treated as a We Work Remotely
+  # category slug and fetched from its own feed
+  # (https://weworkremotely.com/categories/<slug>.rss).
+  weworkremotely:
+    enabled: true
+    feeds:
+      - remote-jobs
+      - remote-programming-jobs
+    # Off by default: fetching every posting's own page (one extra request
+    # per posting, on top of the feed requests) to get its full description
+    # instead of the RSS feed's truncated one. Turn on only with a
+    # deliberately conservative min_request_interval configured for this
+    # source, since it turns O(feeds) requests into O(postings) requests.
+    fetch_full_description: false
+    max_postings_per_feed: 50
+
+  # HTML-scraping source (see sources/freework.py). One search request per
+  # configured keyword against free-work.com's tech/IT job search. This is
+  # the fragile shape: free-work.com publishes no API contract, so a site
+  # redesign can break the selectors this source depends on — see that
+  # module's docstring for how such a failure is surfaced.
+  freework:
+    enabled: true
+    keywords:
+      - "python django"
+      - "développeur backend"
+    max_postings_per_keyword: 50
 
 storage:
   backend: sqlite

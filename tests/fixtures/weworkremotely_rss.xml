@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>We Work Remotely: Remote jobs</title>
+    <link>https://weworkremotely.com</link>
+    <description>The largest remote work community.</description>
+    <item>
+      <title>ExampleCorp: Senior Backend Engineer</title>
+      <link>https://weworkremotely.com/remote-jobs/examplecorp-senior-backend-engineer</link>
+      <pubDate>Wed, 15 Jul 2026 10:00:00 +0000</pubDate>
+      <description><![CDATA[<p>We build the platform that powers our product.</p><p>Requirements: 5+ years of Python.</p> ...]]></description>
+      <region>USA Only</region>
+    </item>
+    <item>
+      <title>This title has no colon separator</title>
+      <link>https://weworkremotely.com/remote-jobs/malformed-title</link>
+      <pubDate>Wed, 15 Jul 2026 11:00:00 +0000</pubDate>
+      <description><![CDATA[<p>Missing the "Company: Title" separator on purpose.</p>]]></description>
+      <region>Anywhere in the World</region>
+    </item>
+    <item>
+      <title>AnotherCo: Missing Link On Purpose</title>
+      <pubDate>Wed, 15 Jul 2026 12:00:00 +0000</pubDate>
+      <description><![CDATA[<p>Missing the link field on purpose to exercise the malformed-item path.</p>]]></description>
+      <region>Europe Only</region>
+    </item>
+    <item>
+      <title>RemoteFirst Inc: Product Designer</title>
+      <link>https://weworkremotely.com/remote-jobs/remotefirst-product-designer</link>
+      <pubDate>Wed, 15 Jul 2026 13:00:00 +0000</pubDate>
+      <description><![CDATA[<p>Design our product end to end.</p> ...]]></description>
+      <region>Anywhere in the World</region>
+    </item>
+  </channel>
+</rss>
