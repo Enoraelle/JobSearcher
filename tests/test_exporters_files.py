@@ -90,9 +90,11 @@ def test_csv_with_no_postings_still_writes_a_header(tmp_path: Path) -> None:
     CsvExporter().export([], _opts(output_path=str(path)))
 
     lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines == ["score,title,company,source,status,work_mode,location,"
-                     "eligible_locations,url,published_at,salary_text,summary,"
-                     "matched_skills,missing_requirements,penalized_skills"]
+    assert lines == [
+        "score,title,company,source,status,work_mode,location,"
+        "eligible_locations,url,published_at,salary_text,summary,"
+        "matched_skills,missing_requirements,penalized_skills"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -239,9 +241,7 @@ def test_unknown_option_is_rejected(exporter: Any, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("exporter", [CsvExporter(), JsonExporter(), MarkdownExporter()])
-def test_unwritable_path_is_wrapped_in_an_exporter_error(
-    exporter: Any, tmp_path: Path
-) -> None:
+def test_unwritable_path_is_wrapped_in_an_exporter_error(exporter: Any, tmp_path: Path) -> None:
     missing_dir = tmp_path / "does-not-exist" / "jobs.out"
     with pytest.raises(ExporterError, match=r"could not write to"):
         exporter.export([_posting()], _opts(output_path=str(missing_dir)))

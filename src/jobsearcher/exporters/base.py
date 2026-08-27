@@ -58,9 +58,7 @@ class ExportResult:
 class Exporter(Protocol):
     """Turns postings into an external representation."""
 
-    def export(
-        self, postings: Sequence[JobPosting], options: PluginConfig
-    ) -> ExportResult:
+    def export(self, postings: Sequence[JobPosting], options: PluginConfig) -> ExportResult:
         """Write ``postings`` to this exporter's destination.
 
         Args:

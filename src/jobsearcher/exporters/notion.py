@@ -124,9 +124,7 @@ class NotionExporter:
         """
         self._client = client
 
-    def export(
-        self, postings: Sequence[JobPosting], options: PluginConfig
-    ) -> ExportResult:
+    def export(self, postings: Sequence[JobPosting], options: PluginConfig) -> ExportResult:
         """Sync ``postings`` into the configured Notion database.
 
         Raises:
@@ -214,9 +212,7 @@ def _resolve_token(config: NotionExporterConfig) -> str:
 class _Session:
     """Thin wrapper over the Notion REST calls one export needs."""
 
-    def __init__(
-        self, client: httpx.Client, token: str, config: NotionExporterConfig
-    ) -> None:
+    def __init__(self, client: httpx.Client, token: str, config: NotionExporterConfig) -> None:
         self._client = client
         self._config = config
         self._headers = {
@@ -322,9 +318,7 @@ class _Session:
             "score": {"number": posting.score},
             "source": {"select": {"name": posting.source}},
         }
-        return {
-            self._config.property_name(field.key): values[field.key] for field in _FIELDS
-        }
+        return {self._config.property_name(field.key): values[field.key] for field in _FIELDS}
 
     def _request(
         self,
@@ -336,13 +330,9 @@ class _Session:
     ) -> dict[str, Any]:
         url = f"{_API_ROOT}{path}"
         try:
-            response = self._client.request(
-                method, url, headers=self._headers, json=json
-            )
+            response = self._client.request(method, url, headers=self._headers, json=json)
         except httpx.HTTPError as exc:
-            raise ExporterError(
-                f"could not reach the Notion API while {context}: {exc}"
-            ) from exc
+            raise ExporterError(f"could not reach the Notion API while {context}: {exc}") from exc
 
         if response.status_code == 200:
             body: dict[str, Any] = response.json()

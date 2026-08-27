@@ -154,9 +154,7 @@ def _write_text(path: Path, text: str) -> None:
 class CsvExporter:
     """Writes postings as a CSV file (one row per posting)."""
 
-    def export(
-        self, postings: Sequence[JobPosting], options: PluginConfig
-    ) -> ExportResult:
+    def export(self, postings: Sequence[JobPosting], options: PluginConfig) -> ExportResult:
         path = _resolve_path(options)
         ordered = _by_score(postings)
 
@@ -173,9 +171,7 @@ class CsvExporter:
 class JsonExporter:
     """Writes postings as a single JSON object."""
 
-    def export(
-        self, postings: Sequence[JobPosting], options: PluginConfig
-    ) -> ExportResult:
+    def export(self, postings: Sequence[JobPosting], options: PluginConfig) -> ExportResult:
         path = _resolve_path(options)
         ordered = _by_score(postings)
 
@@ -192,9 +188,7 @@ class JsonExporter:
 class MarkdownExporter:
     """Writes a human-readable Markdown digest, one bullet per posting."""
 
-    def export(
-        self, postings: Sequence[JobPosting], options: PluginConfig
-    ) -> ExportResult:
+    def export(self, postings: Sequence[JobPosting], options: PluginConfig) -> ExportResult:
         path = _resolve_path(options)
         ordered = _by_score(postings)
 

@@ -245,9 +245,7 @@ def test_missing_api_key_names_the_env_var(monkeypatch: pytest.MonkeyPatch) -> N
 def test_api_key_in_config_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
     with pytest.raises(ExporterError, match=r"`api_key`"):
-        NotionExporter(client=_FakeNotion()).export(
-            [_posting()], _opts(api_key="secret_in_config")
-        )
+        NotionExporter(client=_FakeNotion()).export([_posting()], _opts(api_key="secret_in_config"))
 
 
 def test_missing_database_id_says_what_to_add(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,9 +257,7 @@ def test_missing_database_id_says_what_to_add(monkeypatch: pytest.MonkeyPatch) -
 def test_unknown_option_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
     with pytest.raises(ExporterError, match=r"unknown option `databse_id`"):
-        NotionExporter(client=_FakeNotion()).export(
-            [_posting()], PluginConfig(databse_id=_DB_ID)
-        )
+        NotionExporter(client=_FakeNotion()).export([_posting()], PluginConfig(databse_id=_DB_ID))
 
 
 # --------------------------------------------------------------------------
@@ -333,9 +329,7 @@ def test_bad_token_401_is_explained(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_rate_limit_429_is_explained(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
-    notion = _FakeNotion(
-        status_override=(429, _notion_error(429, "rate_limited", "Slow down."))
-    )
+    notion = _FakeNotion(status_override=(429, _notion_error(429, "rate_limited", "Slow down.")))
 
     with pytest.raises(ExporterError, match=r"rate-limit"):
         NotionExporter(client=notion).export([_posting()], _opts())
