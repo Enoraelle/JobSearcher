@@ -76,16 +76,33 @@ class Storage(Protocol):
         score: int,
         summary: str | None = None,
         matched_skills: Sequence[str] = (),
-        missing_skills: Sequence[str] = (),
+        unmatched_profile_skills: Sequence[str] = (),
+        missing_requirements: Sequence[str] = (),
+        penalized_skills: Sequence[str] = (),
+        location_match: bool | None = None,
+        work_mode_match: bool | None = None,
     ) -> bool:
         """Set the score and related scoring fields of a stored posting.
 
+        The three skill lists have three distinct meanings and are stored
+        separately — see :class:`~jobsearcher.models.ScoreResult`.
+
         Args:
             url: The posting's URL (need not be pre-normalized).
-            score: The new score.
+            score: The new score (skill coverage only).
             summary: A short human-readable rationale for the score, if any.
-            matched_skills: Skills from the posting that matched the user's criteria.
-            missing_skills: Skills the user's criteria call for but the posting lacks.
+            matched_skills: Profile skills the posting mentions.
+            unmatched_profile_skills: Profile skills the posting does not
+                mention (a weak, coverage-only signal).
+            missing_requirements: Skills the posting states it requires that
+                the profile does not cover (a strong signal; only an
+                extracting scorer fills this).
+            penalized_skills: Profile ``absent_skills`` the posting mentions,
+                i.e. what triggered the score penalty.
+            location_match: Whether the posting's location fits the profile,
+                or ``None`` if unknown.
+            work_mode_match: Whether the posting's work mode fits the
+                profile, or ``None`` if unknown.
 
         Returns:
             ``True`` if a posting with that URL was found and updated,

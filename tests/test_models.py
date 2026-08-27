@@ -30,7 +30,11 @@ def test_minimal_valid_posting_has_expected_defaults() -> None:
     assert posting.status is ApplicationStatus.NEW
     assert posting.eligible_locations == []
     assert posting.matched_skills == []
-    assert posting.missing_skills == []
+    assert posting.unmatched_profile_skills == []
+    assert posting.missing_requirements == []
+    assert posting.penalized_skills == []
+    assert posting.location_match is None
+    assert posting.work_mode_match is None
     assert posting.score is None
 
 

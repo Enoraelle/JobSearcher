@@ -128,10 +128,17 @@ class JobPosting(BaseModel):
     eligible_locations: list[str] = Field(default_factory=list)
 
     # --- Scoring ---
+    # The last scoring outcome merged into the posting. See ``ScoreResult``
+    # for the exact meaning of each field; the three skill lists are kept
+    # separate on purpose and never merged.
     score: int | None = Field(default=None, ge=0, le=100)
     summary: str | None = None
     matched_skills: list[str] = Field(default_factory=list)
-    missing_skills: list[str] = Field(default_factory=list)
+    unmatched_profile_skills: list[str] = Field(default_factory=list)
+    missing_requirements: list[str] = Field(default_factory=list)
+    penalized_skills: list[str] = Field(default_factory=list)
+    location_match: bool | None = None
+    work_mode_match: bool | None = None
 
     # --- Application tracking ---
     status: ApplicationStatus = ApplicationStatus.NEW
@@ -168,3 +175,49 @@ class JobPosting(BaseModel):
         if value.tzinfo is None:
             raise ValueError("datetime must be timezone-aware")
         return value.astimezone(UTC)
+
+
+class ScoreResult(BaseModel):
+    """The outcome of scoring one posting against a profile.
+
+    ``score`` reflects **skill coverage only** — how much of the profile's
+    skill set the posting mentions, minus a penalty for skills the profile
+    explicitly rules out. It deliberately does not fold in location or
+    work-mode fit: blending "I can do this job" and "I can take this job"
+    into a single number produces ranking inversions (a perfect-stack
+    posting in an unreachable location lands mid-table, too high to dismiss
+    and too low to explain). Location and work-mode fit are reported next to
+    the score, as ``location_match`` / ``work_mode_match``, and filtered on
+    separately.
+
+    The three skill lists carry three distinct meanings and are never merged
+    into one, because a consumer (an exporter, a CLI filter) must be able to
+    tell them apart without knowing which scorer ran:
+
+    - ``matched_skills``: entries of ``profile.skills`` found in the posting.
+    - ``unmatched_profile_skills``: entries of ``profile.skills`` *not* found
+      in the posting. This is what lowers coverage. It is a **weak** signal
+      and must never be shown as a value judgement on the posting ("this
+      posting ignores my skills") — a terse posting produces many of these
+      with nothing being wrong. It only ever means "coverage is partial,
+      here is on what".
+    - ``missing_requirements``: skills the posting *states it requires* that
+      the profile does not cover. A **strong** signal — a reason not to
+      apply. Only a scorer that reads requirements out of the posting text
+      (the LLM scorer) fills this; the keyword scorer always leaves it
+      empty.
+    - ``penalized_skills``: entries of ``profile.absent_skills`` found in the
+      posting. These trigger the score penalty. Both scorers fill this.
+
+    An empty list is honest information ("this scorer found none"), never an
+    ambiguous or unknown state.
+    """
+
+    score: int = Field(ge=0, le=100)
+    summary: str
+    matched_skills: list[str] = Field(default_factory=list)
+    unmatched_profile_skills: list[str] = Field(default_factory=list)
+    missing_requirements: list[str] = Field(default_factory=list)
+    penalized_skills: list[str] = Field(default_factory=list)
+    location_match: bool | None = None
+    work_mode_match: bool | None = None

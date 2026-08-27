@@ -30,7 +30,11 @@ _COLUMNS: tuple[str, ...] = (
     "score",
     "summary",
     "matched_skills",
-    "missing_skills",
+    "unmatched_profile_skills",
+    "missing_requirements",
+    "penalized_skills",
+    "location_match",
+    "work_mode_match",
     "status",
     "applied_at",
 )
@@ -77,6 +81,20 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_postings_score ON postings(score)",
         "CREATE INDEX IF NOT EXISTS idx_postings_status ON postings(status)",
     ),
+    # Scoring split into three separate skill lists plus two eligibility
+    # flags (see jobsearcher.models.ScoreResult). The old `missing_skills`
+    # column already held exactly "profile skills the posting doesn't
+    # mention", so it is renamed in place rather than dropped and refilled.
+    # `location_match` / `work_mode_match` are nullable: NULL == "not known"
+    # (the posting says nothing, or the profile has no constraint), which is
+    # distinct from 0 == "does not match".
+    3: (
+        "ALTER TABLE postings RENAME COLUMN missing_skills TO unmatched_profile_skills",
+        "ALTER TABLE postings ADD COLUMN missing_requirements TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE postings ADD COLUMN penalized_skills TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE postings ADD COLUMN location_match INTEGER",
+        "ALTER TABLE postings ADD COLUMN work_mode_match INTEGER",
+    ),
 }
 
 CURRENT_SCHEMA_VERSION = max(_MIGRATIONS)
@@ -110,6 +128,21 @@ def _migrate(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def _bool_to_db(value: bool | None) -> int | None:
+    """Encode an optional bool as SQLite's 1 / 0 / NULL."""
+    return None if value is None else int(value)
+
+
+def _db_to_bool(value: Any) -> bool | None:
+    """Decode SQLite's 1 / 0 / NULL back into an optional bool."""
+    return None if value is None else bool(value)
+
+
+def _load_list(value: Any) -> list[str]:
+    """Decode a JSON string list, tolerating the NULL left by an old row."""
+    return list(json.loads(value)) if value else []
+
+
 def _to_row(posting: JobPosting) -> tuple[Any, ...]:
     """Convert a `JobPosting` into a tuple matching `_COLUMNS` order."""
     return (
@@ -130,7 +163,11 @@ def _to_row(posting: JobPosting) -> tuple[Any, ...]:
         posting.score,
         posting.summary,
         json.dumps(posting.matched_skills),
-        json.dumps(posting.missing_skills),
+        json.dumps(posting.unmatched_profile_skills),
+        json.dumps(posting.missing_requirements),
+        json.dumps(posting.penalized_skills),
+        _bool_to_db(posting.location_match),
+        _bool_to_db(posting.work_mode_match),
         posting.status.value,
         posting.applied_at.isoformat() if posting.applied_at else None,
     )
@@ -156,7 +193,11 @@ def _from_row(row: sqlite3.Row) -> JobPosting:
         score=row["score"],
         summary=row["summary"],
         matched_skills=json.loads(row["matched_skills"]),
-        missing_skills=json.loads(row["missing_skills"]),
+        unmatched_profile_skills=_load_list(row["unmatched_profile_skills"]),
+        missing_requirements=_load_list(row["missing_requirements"]),
+        penalized_skills=_load_list(row["penalized_skills"]),
+        location_match=_db_to_bool(row["location_match"]),
+        work_mode_match=_db_to_bool(row["work_mode_match"]),
         status=ApplicationStatus(row["status"]),
         applied_at=datetime.fromisoformat(row["applied_at"]) if row["applied_at"] else None,
     )
@@ -276,17 +317,27 @@ class SqliteStorage:
         score: int,
         summary: str | None = None,
         matched_skills: Sequence[str] = (),
-        missing_skills: Sequence[str] = (),
+        unmatched_profile_skills: Sequence[str] = (),
+        missing_requirements: Sequence[str] = (),
+        penalized_skills: Sequence[str] = (),
+        location_match: bool | None = None,
+        work_mode_match: bool | None = None,
     ) -> bool:
         with self._connection:
             cursor = self._connection.execute(
                 "UPDATE postings SET score = ?, summary = ?, matched_skills = ?, "
-                "missing_skills = ? WHERE url = ?",
+                "unmatched_profile_skills = ?, missing_requirements = ?, "
+                "penalized_skills = ?, location_match = ?, work_mode_match = ? "
+                "WHERE url = ?",
                 (
                     score,
                     summary,
                     json.dumps(list(matched_skills)),
-                    json.dumps(list(missing_skills)),
+                    json.dumps(list(unmatched_profile_skills)),
+                    json.dumps(list(missing_requirements)),
+                    json.dumps(list(penalized_skills)),
+                    _bool_to_db(location_match),
+                    _bool_to_db(work_mode_match),
                     normalize_job_url(url),
                 ),
             )

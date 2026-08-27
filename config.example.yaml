@@ -84,10 +84,31 @@ storage:
   path: "./jobsearcher.db"
 
 scoring:
+  # Offline, deterministic, no API key. The score is skill coverage only:
+  # the share of `profile.skills` the posting mentions, minus a penalty for
+  # each `profile.absent_skills` entry it mentions. Location and work-mode
+  # fit are reported next to the score, not folded into it.
   backend: keyword_match
-  weight_skills: 0.6
-  weight_location: 0.2
-  weight_work_mode: 0.2
+  # Optional. Each list is an equivalence class: any member matches text
+  # containing any other. Matching is already case-, accent- and
+  # punctuation-insensitive, so only add genuinely different spellings.
+  synonyms:
+    - [postgresql, postgres, psql]
+    - [rest apis, rest api, restful]
+    - [kubernetes, k8s]
+  # Subtracted from coverage (0-1 scale) per matched absent skill, capped.
+  # Default 0.34 ≈ three ruled-out skills in one posting zero the score.
+  absent_skill_penalty: 0.34
+  absent_skill_penalty_cap: 1.0
+
+  # Bonus, opt-in, requires `pip install jobsearcher[llm]` and an API key in
+  # the environment (never in this file). Talks to any OpenAI-compatible
+  # endpoint. Uncomment to use it instead of keyword_match.
+  # backend: llm
+  # base_url: "https://api.openai.com/v1"
+  # model: "gpt-4o-mini"
+  # api_key_env: "OPENAI_API_KEY"
+  # max_postings_per_run: 25
 
 exporters:
   markdown_digest:

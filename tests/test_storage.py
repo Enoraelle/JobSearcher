@@ -64,7 +64,11 @@ def test_get_by_url_roundtrips_the_model(storage: SqliteStorage) -> None:
         score=80,
         summary="Good match",
         matched_skills=["python"],
-        missing_skills=["rust"],
+        unmatched_profile_skills=["rust"],
+        missing_requirements=["kubernetes"],
+        penalized_skills=["php"],
+        location_match=True,
+        work_mode_match=False,
         status=ApplicationStatus.SHORTLISTED,
         applied_at=datetime(2025, 12, 5, tzinfo=UTC),
     )
@@ -158,7 +162,10 @@ def test_update_score_changes_only_scoring_fields(storage: SqliteStorage) -> Non
         score=77,
         summary="Solid fit",
         matched_skills=["python", "sql"],
-        missing_skills=["go"],
+        unmatched_profile_skills=["go"],
+        penalized_skills=["php"],
+        location_match=True,
+        work_mode_match=None,
     )
 
     assert updated is True
@@ -167,7 +174,11 @@ def test_update_score_changes_only_scoring_fields(storage: SqliteStorage) -> Non
     assert stored.score == 77
     assert stored.summary == "Solid fit"
     assert stored.matched_skills == ["python", "sql"]
-    assert stored.missing_skills == ["go"]
+    assert stored.unmatched_profile_skills == ["go"]
+    assert stored.missing_requirements == []
+    assert stored.penalized_skills == ["php"]
+    assert stored.location_match is True
+    assert stored.work_mode_match is None
     assert stored.title == posting.title
 
 
@@ -227,7 +238,9 @@ def test_list_fields_roundtrip_empty_single_and_special_characters(
             url=f"https://example.com/jobs/list-{index}",
             eligible_locations=list(values),
             matched_skills=list(values),
-            missing_skills=list(values),
+            unmatched_profile_skills=list(values),
+            missing_requirements=list(values),
+            penalized_skills=list(values),
         )
         storage.save_many([posting])
         stored = storage.get_by_url(posting.url)
@@ -235,22 +248,25 @@ def test_list_fields_roundtrip_empty_single_and_special_characters(
         assert stored is not None
         assert stored.eligible_locations == values
         assert stored.matched_skills == values
-        assert stored.missing_skills == values
+        assert stored.unmatched_profile_skills == values
+        assert stored.missing_requirements == values
+        assert stored.penalized_skills == values
         assert isinstance(stored.eligible_locations, list)
         assert isinstance(stored.matched_skills, list)
-        assert isinstance(stored.missing_skills, list)
+        assert isinstance(stored.unmatched_profile_skills, list)
 
     # An empty list must be stored as an empty JSON array, not SQL NULL (and a
     # non-empty list must not collapse into NULL either): check the raw column.
     connection = sqlite3.connect(db_path)
     try:
         row = connection.execute(
-            "SELECT eligible_locations, matched_skills, missing_skills FROM postings WHERE url = ?",
+            "SELECT eligible_locations, matched_skills, unmatched_profile_skills, "
+            "missing_requirements, penalized_skills FROM postings WHERE url = ?",
             ("https://example.com/jobs/list-0",),
         ).fetchone()
     finally:
         connection.close()
-    assert row == ("[]", "[]", "[]")
+    assert row == ("[]", "[]", "[]", "[]", "[]")
     assert None not in row
 
 
@@ -330,6 +346,54 @@ def test_migration_from_v1_to_v2_preserves_data_and_adds_indexes(db_path: Path) 
     assert version_row is not None
     assert int(version_row[0]) == CURRENT_SCHEMA_VERSION
     assert {"idx_postings_source", "idx_postings_score", "idx_postings_status"} <= index_names
+
+
+def test_migration_v3_renames_missing_skills_and_adds_scoring_columns(db_path: Path) -> None:
+    # Stand up a v1 database with one row, then let SqliteStorage migrate it.
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        for statement in _MIGRATIONS[1]:
+            connection.execute(statement)
+        connection.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+        row = list(_v1_row())
+        row[_v1_columns().index("missing_skills")] = '["python"]'
+        connection.execute(
+            f"INSERT INTO postings ({', '.join(_v1_columns())}) "
+            f"VALUES ({', '.join('?' for _ in _v1_columns())})",
+            row,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SqliteStorage(db_path) as storage:
+        stored = storage.get_by_url("https://example.com/jobs/legacy")
+        assert stored is not None
+        # The old missing_skills column carried "profile skills the posting
+        # doesn't mention", so its data survives the rename verbatim.
+        assert stored.unmatched_profile_skills == ["python"]
+        # New lists default to empty, new flags to "unknown".
+        assert stored.missing_requirements == []
+        assert stored.penalized_skills == []
+        assert stored.location_match is None
+        assert stored.work_mode_match is None
+
+    check = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in check.execute("PRAGMA table_info(postings)").fetchall()}
+    finally:
+        check.close()
+    assert "missing_skills" not in columns
+    assert {
+        "unmatched_profile_skills",
+        "missing_requirements",
+        "penalized_skills",
+        "location_match",
+        "work_mode_match",
+    } <= columns
 
 
 def _v1_columns() -> tuple[str, ...]:
