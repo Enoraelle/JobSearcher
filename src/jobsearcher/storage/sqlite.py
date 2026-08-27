@@ -10,10 +10,17 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode, normalize_job_url
+from jobsearcher.models import (
+    ApplicationStatus,
+    JobPosting,
+    WorkMode,
+    normalize_job_url,
+    posting_id,
+)
 
 _COLUMNS: tuple[str, ...] = (
     "url",
+    "id",
     "raw_url",
     "title",
     "company",
@@ -26,6 +33,7 @@ _COLUMNS: tuple[str, ...] = (
     "salary_text",
     "published_at",
     "fetched_at",
+    "detected_language",
     "eligible_locations",
     "score",
     "summary",
@@ -95,6 +103,20 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE postings ADD COLUMN location_match INTEGER",
         "ALTER TABLE postings ADD COLUMN work_mode_match INTEGER",
     ),
+    # A short, git-style identifier per posting (12 hex chars of
+    # sha256(url); see jobsearcher.models.posting_id) and a best-effort
+    # detected language. Both columns are nullable here: the id is
+    # backfilled for existing rows right after migration by
+    # `_backfill_posting_ids` (SQLite has no sha256 to do it in pure SQL),
+    # and a legacy row's language stays NULL, which is the honest "not
+    # known". The UNIQUE index tolerates the transient NULLs before the
+    # backfill runs (SQLite allows multiple NULLs in a UNIQUE index) and
+    # then enforces uniqueness and powers prefix lookups.
+    4: (
+        "ALTER TABLE postings ADD COLUMN id TEXT",
+        "ALTER TABLE postings ADD COLUMN detected_language TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_postings_id ON postings(id)",
+    ),
 }
 
 CURRENT_SCHEMA_VERSION = max(_MIGRATIONS)
@@ -143,10 +165,48 @@ def _load_list(value: Any) -> list[str]:
     return list(json.loads(value)) if value else []
 
 
+def _filter_clauses(
+    *,
+    source: str | None,
+    status: ApplicationStatus | None,
+    min_score: int | None,
+    max_score: int | None,
+    scored: bool | None,
+    languages: Sequence[str] | None,
+) -> tuple[list[str], list[Any]]:
+    """Build the WHERE clauses and bind parameters shared by `list` and `count`."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if source is not None:
+        clauses.append("source = ?")
+        params.append(source)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status.value)
+    if min_score is not None:
+        clauses.append("score >= ?")
+        params.append(min_score)
+    if max_score is not None:
+        clauses.append("score <= ?")
+        params.append(max_score)
+    if scored is True:
+        clauses.append("score IS NOT NULL")
+    elif scored is False:
+        clauses.append("score IS NULL")
+    if languages:
+        placeholders = ", ".join("?" for _ in languages)
+        # A NULL (undetermined) language is never filtered out — see the
+        # module docstring in jobsearcher.language.
+        clauses.append(f"(detected_language IS NULL OR detected_language IN ({placeholders}))")
+        params.extend(languages)
+    return clauses, params
+
+
 def _to_row(posting: JobPosting) -> tuple[Any, ...]:
     """Convert a `JobPosting` into a tuple matching `_COLUMNS` order."""
     return (
         posting.url,
+        posting.id,
         posting.raw_url,
         posting.title,
         posting.company,
@@ -159,6 +219,7 @@ def _to_row(posting: JobPosting) -> tuple[Any, ...]:
         posting.salary_text,
         posting.published_at.isoformat() if posting.published_at else None,
         posting.fetched_at.isoformat(),
+        posting.detected_language,
         json.dumps(posting.eligible_locations),
         posting.score,
         posting.summary,
@@ -189,6 +250,7 @@ def _from_row(row: sqlite3.Row) -> JobPosting:
         salary_text=row["salary_text"],
         published_at=datetime.fromisoformat(row["published_at"]) if row["published_at"] else None,
         fetched_at=datetime.fromisoformat(row["fetched_at"]),
+        detected_language=row["detected_language"],
         eligible_locations=json.loads(row["eligible_locations"]),
         score=row["score"],
         summary=row["summary"],
@@ -223,6 +285,24 @@ class SqliteStorage:
         self._connection = sqlite3.connect(str(database), timeout=timeout)
         self._connection.row_factory = sqlite3.Row
         _migrate(self._connection)
+        self._backfill_posting_ids()
+
+    def _backfill_posting_ids(self) -> None:
+        """Fill the `id` column for rows that predate schema version 4.
+
+        SQLite has no SHA-256, so the identifier cannot be computed in the
+        migration's SQL. This runs once per legacy row (``WHERE id IS
+        NULL``) and no-ops thereafter, so opening an already-migrated
+        database costs a single cheap query.
+        """
+        rows = self._connection.execute("SELECT url FROM postings WHERE id IS NULL").fetchall()
+        if not rows:
+            return
+        with self._connection:
+            self._connection.executemany(
+                "UPDATE postings SET id = ? WHERE url = ?",
+                [(posting_id(row["url"]), row["url"]) for row in rows],
+            )
 
     def __enter__(self) -> SqliteStorage:
         return self
@@ -274,6 +354,25 @@ class SqliteStorage:
         ).fetchone()
         return _from_row(row) if row is not None else None
 
+    def find_by_id_prefix(self, prefix: str) -> list[JobPosting]:
+        """Return every posting whose identifier starts with ``prefix``.
+
+        The caller (the CLI) is responsible for validating that ``prefix``
+        is a plausible identifier fragment; this method treats it literally.
+
+        Args:
+            prefix: The leading hex characters of a posting identifier.
+
+        Returns:
+            All matching postings, most recently fetched first. Empty if
+            none match.
+        """
+        rows = self._connection.execute(
+            "SELECT * FROM postings WHERE id LIKE ? ESCAPE '\\' ORDER BY fetched_at DESC",
+            (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
+        ).fetchall()
+        return [_from_row(row) for row in rows]
+
     def list(
         self,
         *,
@@ -281,23 +380,19 @@ class SqliteStorage:
         status: ApplicationStatus | None = None,
         min_score: int | None = None,
         max_score: int | None = None,
+        scored: bool | None = None,
+        languages: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[JobPosting]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if source is not None:
-            clauses.append("source = ?")
-            params.append(source)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status.value)
-        if min_score is not None:
-            clauses.append("score >= ?")
-            params.append(min_score)
-        if max_score is not None:
-            clauses.append("score <= ?")
-            params.append(max_score)
+        clauses, params = _filter_clauses(
+            source=source,
+            status=status,
+            min_score=min_score,
+            max_score=max_score,
+            scored=scored,
+            languages=languages,
+        )
 
         sql = "SELECT * FROM postings"
         if clauses:
@@ -366,15 +461,19 @@ class SqliteStorage:
         *,
         source: str | None = None,
         status: ApplicationStatus | None = None,
+        min_score: int | None = None,
+        max_score: int | None = None,
+        scored: bool | None = None,
+        languages: Sequence[str] | None = None,
     ) -> int:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if source is not None:
-            clauses.append("source = ?")
-            params.append(source)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status.value)
+        clauses, params = _filter_clauses(
+            source=source,
+            status=status,
+            min_score=min_score,
+            max_score=max_score,
+            scored=scored,
+            languages=languages,
+        )
 
         sql = "SELECT COUNT(*) FROM postings"
         if clauses:

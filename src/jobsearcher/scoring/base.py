@@ -27,6 +27,18 @@ from jobsearcher.config import ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult, WorkMode
 
 
+class ScorerBudgetExhaustedError(Exception):
+    """A metered scorer has spent its per-run budget; stop calling it.
+
+    Raised by scorers that cost money or rate-limited calls (see
+    :class:`~jobsearcher.scoring.llm.LlmScorer`). The pipeline catches this
+    to end the scoring phase cleanly, leaving the remaining postings
+    unscored for a later run rather than treating it as a failure. The
+    always-available :class:`~jobsearcher.scoring.keyword.KeywordScorer`
+    never raises it.
+    """
+
+
 class Scorer(Protocol):
     """Turns a posting plus a profile into a :class:`ScoreResult`."""
 
@@ -103,6 +115,7 @@ def evaluate_work_mode_match(posting: JobPosting, profile: ProfileConfig) -> boo
 __all__ = [
     "ScoreResult",
     "Scorer",
+    "ScorerBudgetExhaustedError",
     "evaluate_location_match",
     "evaluate_work_mode_match",
 ]

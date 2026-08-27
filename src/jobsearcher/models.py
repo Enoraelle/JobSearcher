@@ -6,12 +6,19 @@ a package — see the "File vs. package" convention in CLAUDE.md.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+
+# Number of hex characters kept from the SHA-256 digest of a posting's
+# normalized URL to form its short identifier. Twelve keeps the collision
+# probability negligible well past any realistic database size; consumers
+# that display the id (the CLI) truncate further and resolve by prefix.
+_POSTING_ID_LENGTH: Final[int] = 12
 
 # Query parameters stripped during URL normalization because they identify a
 # traffic source rather than the job posting itself. Two URLs that only differ
@@ -94,6 +101,30 @@ def normalize_job_url(value: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def posting_id(url: str) -> str:
+    """Return the stable short identifier for a posting URL.
+
+    The identifier is the first :data:`_POSTING_ID_LENGTH` hex characters of
+    the SHA-256 digest of the *normalized* URL. Because it derives only from
+    the URL, it is identical on every machine and can be recomputed outside
+    the database — which is what makes it safe to cite in a bug report or
+    paste into a tracker, unlike an auto-incrementing row counter that would
+    not survive an export, a rebuilt database, or a comparison between two
+    machines.
+
+    Args:
+        url: A posting URL, normalized or not.
+
+    Returns:
+        The lowercase hex identifier.
+
+    Raises:
+        ValueError: If ``url`` is not an absolute URL.
+    """
+    digest = hashlib.sha256(normalize_job_url(url).encode("utf-8")).hexdigest()
+    return digest[:_POSTING_ID_LENGTH]
+
+
 class JobPosting(BaseModel):
     """A single job posting collected from a source.
 
@@ -122,6 +153,13 @@ class JobPosting(BaseModel):
     published_at: datetime | None = None
     fetched_at: datetime
 
+    # Best-effort language of the posting text, filled at collection time by
+    # the heuristic in :mod:`jobsearcher.language`. ``None`` means
+    # "undetermined" (text too short, or no language clearly won) — a state
+    # kept distinct from "a language outside the supported set", and one that
+    # a language filter must never hide.
+    detected_language: str | None = None
+
     # --- Geography / eligibility ---
     # Captures restrictions such as "Only candidates in India" or
     # "Remote - US", which `location` and `work_mode` cannot express alone.
@@ -143,6 +181,12 @@ class JobPosting(BaseModel):
     # --- Application tracking ---
     status: ApplicationStatus = ApplicationStatus.NEW
     applied_at: datetime | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def id(self) -> str:
+        """The posting's stable short identifier (see :func:`posting_id`)."""
+        return posting_id(self.url)
 
     @model_validator(mode="before")
     @classmethod

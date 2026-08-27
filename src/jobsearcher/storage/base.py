@@ -44,6 +44,19 @@ class Storage(Protocol):
         """
         ...
 
+    def find_by_id_prefix(self, prefix: str) -> list[JobPosting]:
+        """Return every posting whose identifier starts with ``prefix``.
+
+        Args:
+            prefix: The leading hex characters of a posting identifier (see
+                :func:`jobsearcher.models.posting_id`). Treated literally;
+                the caller validates that it is a plausible fragment.
+
+        Returns:
+            All matching postings, most recently fetched first.
+        """
+        ...
+
     def list(
         self,
         *,
@@ -51,6 +64,8 @@ class Storage(Protocol):
         status: ApplicationStatus | None = None,
         min_score: int | None = None,
         max_score: int | None = None,
+        scored: bool | None = None,
+        languages: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
     ) -> list[JobPosting]:
@@ -61,6 +76,11 @@ class Storage(Protocol):
             status: Restrict to postings with this application status, if given.
             min_score: Restrict to postings with a score >= this value, if given.
             max_score: Restrict to postings with a score <= this value, if given.
+            scored: ``True`` for only scored postings, ``False`` for only
+                unscored ones, ``None`` (default) for both.
+            languages: Restrict to postings whose detected language is one of
+                these, if given. Postings with an undetermined language
+                (``None``) always pass this filter.
             limit: Maximum number of postings to return, if given.
             offset: Number of matching postings to skip before returning results.
 
@@ -135,12 +155,22 @@ class Storage(Protocol):
         *,
         source: str | None = None,
         status: ApplicationStatus | None = None,
+        min_score: int | None = None,
+        max_score: int | None = None,
+        scored: bool | None = None,
+        languages: Sequence[str] | None = None,
     ) -> int:
         """Count stored postings, optionally filtered.
 
         Args:
             source: Restrict to postings from this source, if given.
             status: Restrict to postings with this application status, if given.
+            min_score: Restrict to postings with a score >= this value, if given.
+            max_score: Restrict to postings with a score <= this value, if given.
+            scored: ``True`` for only scored, ``False`` for only unscored,
+                ``None`` for both.
+            languages: Restrict to these detected languages (``None``-language
+                postings always pass), if given.
 
         Returns:
             The number of matching postings.

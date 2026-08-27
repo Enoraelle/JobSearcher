@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode
+from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode, posting_id
 from jobsearcher.storage.sqlite import _MIGRATIONS, CURRENT_SCHEMA_VERSION, SqliteStorage
 
 
@@ -394,6 +394,95 @@ def test_migration_v3_renames_missing_skills_and_adds_scoring_columns(db_path: P
         "location_match",
         "work_mode_match",
     } <= columns
+
+
+def test_id_is_populated_on_insert_and_matches_posting_id(
+    storage: SqliteStorage, db_path: Path
+) -> None:
+    posting = _make_posting(url="https://example.com/jobs/ident")
+    storage.save_many([posting])
+
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute("SELECT id FROM postings WHERE url = ?", (posting.url,)).fetchone()
+    finally:
+        connection.close()
+    assert row[0] == posting_id(posting.url) == posting.id
+    assert len(row[0]) == 12
+
+
+def test_find_by_id_prefix_resolves_git_style(storage: SqliteStorage) -> None:
+    postings = [_make_posting(url=f"https://example.com/jobs/{i}") for i in range(5)]
+    storage.save_many(postings)
+
+    target = storage.list()[0]
+    matches = storage.find_by_id_prefix(target.id[:6])
+
+    assert [p.url for p in matches] == [target.url]
+    assert storage.find_by_id_prefix("zzzz") == []
+
+
+def test_list_scored_filter(storage: SqliteStorage) -> None:
+    storage.save_many(
+        [
+            _make_posting(url="https://example.com/jobs/scored", score=80),
+            _make_posting(url="https://example.com/jobs/unscored", score=None),
+        ]
+    )
+
+    assert {p.url for p in storage.list(scored=True)} == {"https://example.com/jobs/scored"}
+    assert {p.url for p in storage.list(scored=False)} == {"https://example.com/jobs/unscored"}
+    assert storage.count(scored=False) == 1
+
+
+def test_list_language_filter_keeps_undetermined_postings(storage: SqliteStorage) -> None:
+    storage.save_many(
+        [
+            _make_posting(url="https://example.com/jobs/fr", detected_language="fr"),
+            _make_posting(url="https://example.com/jobs/en", detected_language="en"),
+            _make_posting(url="https://example.com/jobs/unknown", detected_language=None),
+        ]
+    )
+
+    urls = {p.url for p in storage.list(languages=["fr"])}
+
+    # The French posting matches; the undetermined one is never hidden; the
+    # English one is filtered out.
+    assert urls == {"https://example.com/jobs/fr", "https://example.com/jobs/unknown"}
+
+
+def test_migration_v1_to_v4_backfills_ids(db_path: Path) -> None:
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        for statement in _MIGRATIONS[1]:
+            connection.execute(statement)
+        connection.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+        connection.execute(
+            f"INSERT INTO postings ({', '.join(_v1_columns())}) "
+            f"VALUES ({', '.join('?' for _ in _v1_columns())})",
+            _v1_row(),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SqliteStorage(db_path) as storage:
+        stored = storage.get_by_url("https://example.com/jobs/legacy")
+        assert stored is not None
+        assert stored.detected_language is None
+
+    check = sqlite3.connect(db_path)
+    try:
+        row = check.execute(
+            "SELECT id FROM postings WHERE url = ?", ("https://example.com/jobs/legacy",)
+        ).fetchone()
+    finally:
+        check.close()
+    assert row[0] == posting_id("https://example.com/jobs/legacy")
 
 
 def _v1_columns() -> tuple[str, ...]:

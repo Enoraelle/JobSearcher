@@ -13,6 +13,12 @@ search:
     - "senior"
     - "staff"
     - "lead"
+  # NOT a collection filter. Nothing is dropped while fetching: every posting
+  # is tagged with a best-effort detected language (fr/en/de/es, or blank when
+  # undetermined) and this list is only the default filter `jobsearcher list`
+  # applies at display time. Override it per run with `--language <code>` or
+  # see everything with `--language all`; postings whose language could not be
+  # determined are never hidden.
   languages:
     - en
     - fr

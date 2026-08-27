@@ -71,6 +71,7 @@ import httpx
 from pydantic import ValidationError
 
 from jobsearcher.config import PluginConfig
+from jobsearcher.language import detect_language
 from jobsearcher.models import JobPosting
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,13 @@ class Source(ABC):
                     self.last_run.skipped += 1
                     logger.warning("Source %r: skipping a malformed posting (%s)", self.name, exc)
                     continue
+                # Language tagging happens here, once, rather than in every
+                # source's normalize(): it is the same heuristic for all of
+                # them and needs the finished posting's text. It never drops
+                # a posting — an undetermined verdict is just left as None.
+                posting.detected_language = detect_language(
+                    f"{posting.title}\n{posting.description_clean or posting.description_raw}"
+                )
                 self.last_run.yielded += 1
                 yield posting
         except SourceError as exc:

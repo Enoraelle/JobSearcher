@@ -25,13 +25,20 @@ The package lives under `src/jobsearcher/` and is split by responsibility:
   into a score. No I/O.
 - `exporters/` — turn stored/scored postings into an external representation
   (file formats, third-party services). No scraping logic.
-- `cli.py` — the `jobsearcher` console entry point (Click). Wires the layers
-  above together; contains no business logic of its own.
+- `pipeline.py` — orchestration only: run the enabled sources, filter by the
+  configured keywords, store, score the unscored postings, export. Each
+  phase is independent and resumable (it persists as it goes); the phase
+  methods are generators so the CLI can show progress. No rendering, no
+  argument parsing.
+- `cli.py` — the `jobsearcher` console entry point (Click + Rich). Parses
+  arguments, calls `pipeline` (for fetch/score/export/run) or `storage`
+  directly (for list/show/status), renders the result, and picks the exit
+  code. Contains no business logic of its own.
 
 Dependencies should flow one way: `sources` and `exporters` depend on
 `models`; `scoring` depends on `models`; `storage` depends on `models`;
-`cli` depends on everything else. Avoid circular imports between the
-subpackages.
+`pipeline` depends on all of those; `cli` depends on everything else. Avoid
+circular imports between the subpackages.
 
 ## File vs. package
 

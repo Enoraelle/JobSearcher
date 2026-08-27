@@ -44,7 +44,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - deps ship with the base
 
 from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult
-from jobsearcher.scoring.base import evaluate_location_match, evaluate_work_mode_match
+from jobsearcher.scoring.base import (
+    ScorerBudgetExhaustedError,
+    evaluate_location_match,
+    evaluate_work_mode_match,
+)
 
 _DEFAULT_BASE_URL: Final = "https://api.openai.com/v1"
 _DEFAULT_MODEL: Final = "gpt-4o-mini"
@@ -75,8 +79,13 @@ class LlmScoringError(RuntimeError):
     """
 
 
-class BudgetExhaustedError(RuntimeError):
-    """The per-run posting budget for the LLM scorer has been spent."""
+class BudgetExhaustedError(ScorerBudgetExhaustedError):
+    """The per-run posting budget for the LLM scorer has been spent.
+
+    Subclasses the backend-neutral
+    :class:`~jobsearcher.scoring.base.ScorerBudgetExhaustedError` so the pipeline
+    can react to "stop scoring" without importing this optional module.
+    """
 
 
 class _LlmVerdict(BaseModel):
