@@ -111,9 +111,35 @@ scoring:
   # max_postings_per_run: 25
 
 exporters:
-  markdown_digest:
+  # Offline file formats, standard library only. Each needs an `output_path`.
+  # Postings are written sorted by score, highest first. The Markdown file is
+  # meant to be read by a person: one bullet per posting with a link, and the
+  # posting's geographic eligibility restrictions shown when it has any.
+  markdown:
     enabled: true
     output_path: "./digest.md"
+  csv:
+    enabled: false
+    output_path: "./jobs.csv"
+  json:
+    enabled: false
+    output_path: "./jobs.json"
+
+  # Bonus, opt-in, requires `pip install jobsearcher[notion]`. Keeps one
+  # database page per posting, matched by URL so re-exporting updates rather
+  # than duplicates; the application status goes to a select property. The
+  # integration token is read only from the environment variable named by
+  # `api_key_env` (never from this file). The database must already have the
+  # properties below (types in parentheses); a missing or mistyped one is
+  # reported with the exact property to create.
   notion:
-    enabled: true
+    enabled: false
     database_id: "your-notion-database-id"
+    api_key_env: "NOTION_API_KEY"
+    # Property names, if yours differ from these defaults:
+    # title_property: "Name"        # (title)
+    # url_property: "URL"           # (url)   — the idempotency key
+    # status_property: "Status"    # (select)
+    # company_property: "Company"  # (rich text)
+    # score_property: "Score"      # (number)
+    # source_property: "Source"    # (select)
