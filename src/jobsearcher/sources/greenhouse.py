@@ -10,6 +10,12 @@ That endpoint does not return a company display name, only the postings for
 the board identified by `slug` — so the company name attached to each
 posting is derived from the configured slug itself (see `_humanize_slug`).
 
+Two quirks of that response shape are handled here rather than downstream:
+the `content` field arrives HTML-*escaped* and has to be unescaped before it
+can be parsed as markup (see `_description_html`), and there is no
+structured remote/hybrid flag, so the work mode is inferred (see
+`_infer_work_mode`).
+
 A realistic configuration lists ten to seventy company slugs. Each is an
 independent unit of collection: `fetch_raw` fetches and yields one company's
 jobs at a time and, if that company's request fails (a 404 for a misspelled
@@ -24,17 +30,18 @@ offending slug and the `sources.greenhouse.companies` field, and
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from html.parser import HTMLParser
 from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jobsearcher.config import PluginConfig
 from jobsearcher.models import JobPosting, WorkMode
+from jobsearcher.sources._html import strip_html
 from jobsearcher.sources.base import (
     Source,
     SourceConfigError,
@@ -43,13 +50,6 @@ from jobsearcher.sources.base import (
 )
 
 _JOB_BOARD_URL: Final[str] = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-
-# Block-level tags that should introduce a line break when extracting plain
-# text from a job description's HTML, so e.g. adjacent <p> tags don't run
-# together into one word-salad line.
-_BLOCK_TAGS: Final[frozenset[str]] = frozenset(
-    {"p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
-)
 
 # Heuristics for pulling a geographic restriction out of free text. These are
 # best-effort: Greenhouse gives no structured eligibility field, so this
@@ -60,6 +60,18 @@ _REMOTE_LOCATION_RE: Final[re.Pattern[str]] = re.compile(
     r"remote\s*[-–—:]\s*(.+)",  # noqa: RUF001 (en/em dash used by real listings)
     re.IGNORECASE,
 )
+# Work-mode inference (see `_infer_work_mode`). A marker preceded by one of
+# these words within `_NEGATION_WINDOW` tokens is a mention of the
+# arrangement being ruled *out*, not offered. The set is kept small and
+# unambiguous on purpose: a missed negation only restores the previous
+# behaviour, while a word like "can" would negate the sentences that grant
+# remote work.
+_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[a-z]+")
+_WORK_MODE_NEGATORS: Final[frozenset[str]] = frozenset(
+    {"no", "non", "not", "never", "neither", "nor", "without", "rarely"}
+)
+_NEGATION_WINDOW: Final[int] = 3
+
 _RESTRICTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"only candidates (?:based |located )?in ([A-Za-z ,]+)", re.IGNORECASE),
     re.compile(r"must be (?:based|located) in ([A-Za-z ,]+)", re.IGNORECASE),
@@ -84,37 +96,29 @@ class GreenhouseSourceConfig(BaseModel):
     max_postings_per_company: int | None = Field(default=None, ge=1)
 
 
-class _HTMLTextExtractor(HTMLParser):
-    """Extracts plain text from HTML, inserting line breaks at block tags."""
+def _description_html(raw: dict[str, Any]) -> str:
+    """Return a job's description as real HTML, ready to be parsed.
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._chunks: list[str] = []
+    The Job Board API delivers `content` **HTML-escaped**: the wire value of
+    a paragraph is the literal text ``&lt;p&gt;``, not ``<p>``. Feeding that
+    straight to an HTML parser is a no-op — the parser sees text, decodes
+    the entities, and hands back a string still full of ``<p>`` tags, which
+    then travel into the score haystack (where `p`, `li` and `strong` count
+    as words), the language heuristic, and every export.
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _BLOCK_TAGS:
-            self._chunks.append("\n")
+    One `html.unescape` turns the wire value into the markup it represents.
+    Entities inside the prose itself (`&amp;amp;` for a literal `&`) are
+    left one level escaped by that same pass and are decoded by the HTML
+    parser afterwards, so each is decoded exactly once.
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag in _BLOCK_TAGS:
-            self._chunks.append("\n")
+    Args:
+        raw: One job dict as returned by the API.
 
-    def handle_data(self, data: str) -> None:
-        self._chunks.append(data)
-
-    def get_text(self) -> str:
-        return "".join(self._chunks)
-
-
-def _strip_html(html_content: str) -> str:
-    """Convert an HTML description into cleaned-up plain text."""
-    if not html_content.strip():
-        return ""
-    extractor = _HTMLTextExtractor()
-    extractor.feed(html_content)
-    extractor.close()
-    lines = (line.strip() for line in extractor.get_text().splitlines())
-    return "\n".join(line for line in lines if line)
+    Returns:
+        The description as HTML, or an empty string if the job carries none.
+    """
+    content = raw.get("content") or ""
+    return html.unescape(content)
 
 
 def _humanize_slug(slug: str) -> str:
@@ -131,12 +135,55 @@ def _extract_location_name(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _mode_is_asserted(tokens: list[str], marker: str) -> bool:
+    """Whether ``marker`` appears as a whole token that is not negated.
+
+    Two things go wrong with a plain ``marker in text`` over a description:
+    it fires inside longer words, and — far more often — it fires on the
+    sentence that rules the arrangement *out*. "This role is not remote" is
+    the single most common way a posting mentions remote work, and reading
+    it as REMOTE puts the posting straight into `--remote`.
+
+    Args:
+        tokens: The lowercased word tokens of the text to search.
+        marker: The whole token to look for.
+
+    Returns:
+        Whether at least one occurrence of ``marker`` stands unnegated.
+    """
+    return any(
+        token == marker
+        and not _WORK_MODE_NEGATORS.intersection(tokens[max(0, index - _NEGATION_WINDOW) : index])
+        for index, token in enumerate(tokens)
+    )
+
+
 def _infer_work_mode(location_name: str | None, description_clean: str) -> WorkMode:
-    haystack = f"{location_name or ''} {description_clean}".lower()
-    if "remote" in haystack:
+    """Best-effort work arrangement, since Greenhouse has no field for it.
+
+    `location.name` is checked first and on its own: it is the board's own
+    assertion about the job, while the description is prose in which the
+    word "remote" turns up in negations, asides about other teams, and
+    boilerplate. The description is only consulted when the location says
+    nothing about the arrangement, and then only for unnegated whole-token
+    mentions (see `_mode_is_asserted`).
+
+    `--remote` filters on the result, so this errs toward ONSITE/UNKNOWN
+    rather than claiming an arrangement the posting did not assert.
+    """
+    if location_name:
+        location_tokens = _WORD_RE.findall(location_name.casefold())
+        if _mode_is_asserted(location_tokens, "remote"):
+            return WorkMode.REMOTE
+        if _mode_is_asserted(location_tokens, "hybrid"):
+            return WorkMode.HYBRID
+
+    description_tokens = _WORD_RE.findall(description_clean.casefold())
+    if _mode_is_asserted(description_tokens, "remote"):
         return WorkMode.REMOTE
-    if "hybrid" in haystack:
+    if _mode_is_asserted(description_tokens, "hybrid"):
         return WorkMode.HYBRID
+
     if location_name:
         return WorkMode.ONSITE
     return WorkMode.UNKNOWN
@@ -168,12 +215,30 @@ def _extract_eligible_locations(location_name: str | None, description_clean: st
 
 
 def _parse_datetime(value: Any) -> datetime | None:
+    """Parse a Greenhouse timestamp into a UTC-aware datetime.
+
+    `JobPosting` requires timezone-aware datetimes, and a naive one raises —
+    which `Source.fetch` would count as a malformed item and skip, losing
+    the whole posting over an optional metadata field. A value that has no
+    offset is therefore read as UTC (what the API documents its timestamps
+    to be) rather than propagated as-is, and one that cannot be parsed at
+    all becomes `None`, which the model accepts.
+
+    Args:
+        value: The raw `updated_at` field, of whatever type the API sent.
+
+    Returns:
+        The timestamp in UTC, or `None` if there is none to read.
+    """
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 @register_source("greenhouse")
@@ -268,8 +333,11 @@ class GreenhouseSource(Source):
         if missing:
             raise KeyError(f"Greenhouse job is missing required field(s): {missing}")
 
-        description_raw = raw.get("content") or ""
-        description_clean = _strip_html(description_raw)
+        # `description_raw` keeps the markup as sent (unescaped once, so it
+        # is HTML rather than text-that-looks-like-HTML); `description_clean`
+        # is the plain text everything downstream actually reads.
+        description_raw = _description_html(raw)
+        description_clean = strip_html(description_raw)
         location_name = _extract_location_name(raw)
 
         return JobPosting(

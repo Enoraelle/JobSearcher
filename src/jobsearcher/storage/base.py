@@ -20,7 +20,23 @@ class Storage(Protocol):
     identity is its (normalized) URL: saving a posting whose URL already
     exists must not duplicate or overwrite the stored row, including its
     score.
+
+    A read must never fail wholesale because one stored row cannot be
+    decoded: it skips that row and counts it in
+    :attr:`unreadable_rows`. Callers that present results to a user are
+    expected to surface a non-zero count.
     """
+
+    @property
+    def unreadable_rows(self) -> int:
+        """How many stored rows the most recent read had to skip.
+
+        Reset at the start of every read operation, so it describes the last
+        one rather than the lifetime of the handle. A non-zero value means
+        the results are incomplete: ``count()`` and ``len(list())`` will
+        disagree by exactly this many.
+        """
+        ...
 
     def save_many(self, postings: Sequence[JobPosting]) -> int:
         """Persist postings, skipping any whose URL is already stored.
@@ -40,7 +56,12 @@ class Storage(Protocol):
             url: The posting's URL (need not be pre-normalized).
 
         Returns:
-            The matching posting, or ``None`` if no posting has that URL.
+            The matching posting, or ``None`` if no posting has that URL —
+            or if its row could not be decoded, which
+            :attr:`unreadable_rows` tells apart.
+
+        Raises:
+            ValueError: If ``url`` is not an absolute URL.
         """
         ...
 

@@ -6,6 +6,8 @@ validated ``storage:`` config block into a ready :class:`Storage`.
 
 from __future__ import annotations
 
+import sqlite3
+
 from jobsearcher.config import BackendSectionConfig
 from jobsearcher.storage.base import Storage
 from jobsearcher.storage.sqlite import SqliteStorage
@@ -30,7 +32,11 @@ def open_storage(config: BackendSectionConfig) -> SqliteStorage:
         a context manager).
 
     Raises:
-        StorageConfigError: If ``backend`` is not ``sqlite``.
+        StorageConfigError: If ``backend`` is not ``sqlite``, or the
+            database at ``path`` cannot be opened or migrated — a missing
+            parent directory, a permission problem, a file that is not a
+            SQLite database. Every command opens storage first, so these
+            surface as an actionable message rather than a traceback.
     """
     if config.backend != "sqlite":
         raise StorageConfigError(
@@ -38,7 +44,14 @@ def open_storage(config: BackendSectionConfig) -> SqliteStorage:
         )
     extra = config.model_dump()
     path = extra.get("path") or _DEFAULT_SQLITE_PATH
-    return SqliteStorage(str(path))
+    try:
+        return SqliteStorage(str(path))
+    except sqlite3.Error as exc:
+        raise StorageConfigError(
+            f"could not open the SQLite database at '{path}' (from storage.path): {exc}. "
+            f"Check that its parent directory exists and is writable, and that the file "
+            f"is a JobSearcher database."
+        ) from exc
 
 
 __all__ = ["SqliteStorage", "Storage", "StorageConfigError", "open_storage"]

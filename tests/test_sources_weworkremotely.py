@@ -32,6 +32,28 @@ def _main_feed_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, text=MAIN_FEED_XML)
 
 
+def _rss_with_description(description: str) -> str:
+    """A one-item feed whose <description> carries `description` verbatim."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0"><channel><title>WWR</title>'
+        "<item>"
+        "<title>ExampleCorp: Backend Engineer</title>"
+        "<link>https://weworkremotely.com/remote-jobs/malformed-html</link>"
+        "<pubDate>Wed, 15 Jul 2026 10:00:00 +0000</pubDate>"
+        f"<description><![CDATA[{description}]]></description>"
+        "<region>Anywhere in the World</region>"
+        "</item></channel></rss>"
+    )
+
+
+def _feed_handler_for(xml_text: str) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=xml_text)
+
+    return handler
+
+
 def test_fetch_yields_valid_items_and_skips_the_malformed_ones() -> None:
     source = _source(_main_feed_handler)
 
@@ -251,3 +273,49 @@ def test_empty_feeds_list_is_rejected_at_construction() -> None:
 
     with pytest.raises(SourceConfigError):
         WeWorkRemotelySource("weworkremotely", config, client=client)
+
+
+# --------------------------------------------------------------------------
+# The RSS description is arbitrary HTML from a third party
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "<p>Unclosed paragraph with <strong>bold text",
+        "<div><p>Nested <div>divs</div> left open",
+        "<ul><li>One<li>Two<li>Three",  # implicit list-item closes
+        "Plain text with a stray < angle bracket",
+        "<p>Entities: caf&eacute; &amp; co&nbsp;</p>",
+        "<script>alert(1)</script><p>After the script.</p>",
+    ],
+)
+def test_a_malformed_rss_description_still_yields_the_posting(description: str) -> None:
+    """Markup this source does not control must degrade, never drop a job."""
+    source = _source(_feed_handler_for(_rss_with_description(description)))
+
+    postings = list(source.fetch())
+
+    assert len(postings) == 1
+    assert source.last_run.skipped == 0
+    assert source.last_run.failed is False
+    assert postings[0].description_clean is not None
+    assert "<p>" not in postings[0].description_clean
+
+
+def test_a_description_that_is_only_markup_leaves_clean_text_empty() -> None:
+    source = _source(_feed_handler_for(_rss_with_description("<p></p><div></div>")))
+
+    postings = list(source.fetch())
+
+    assert len(postings) == 1
+    assert postings[0].description_clean == ""
+
+
+def test_html_entities_in_the_description_are_decoded() -> None:
+    source = _source(_feed_handler_for(_rss_with_description("<p>R&amp;D in caf&eacute;s</p>")))
+
+    postings = list(source.fetch())
+
+    assert postings[0].description_clean == "R&D in cafés"

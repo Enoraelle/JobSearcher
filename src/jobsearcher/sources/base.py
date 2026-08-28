@@ -45,12 +45,13 @@ Both inherit from `SourceError` so a caller that only wants the general
 
 Every `fetch()` call records a `SourceRunStats` on `last_run`, with an
 `errors` entry for every failed unit (or the single failure that stopped the
-source from starting) and a `failed` flag with a precise meaning: *the
-source produced nothing usable* — either it could not start at all, or every
-unit it attempted failed. A partial failure — some units succeeded, one
-didn't — leaves `failed` at `False` and records the failure in `errors`
-instead. Without that distinction, "70 companies, all fine" and "70
-companies, all 404ing because the token expired" would both report zero
+source) and a `failed` flag with a precise meaning: *the source produced
+nothing usable* — either it could not start at all, or every unit it
+attempted failed. A partial failure — some units succeeded, one didn't, or
+the source delivered postings and then broke — leaves `failed` at `False`
+and records the failure in `errors` instead. Without that distinction, "70
+companies, all fine" and "70 companies, all 404ing because the token
+expired" would both report zero
 errors and be indistinguishable from a caller's point of view; and without
 `errors` at all, "this source found nothing today" and "this source has
 been broken for three weeks" would produce the exact same empty output. Both
@@ -62,7 +63,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Final, TypeVar
@@ -70,6 +71,7 @@ from typing import Any, Final, TypeVar
 import httpx
 from pydantic import ValidationError
 
+from jobsearcher import __version__
 from jobsearcher.config import PluginConfig
 from jobsearcher.language import detect_language
 from jobsearcher.models import JobPosting
@@ -79,7 +81,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT: Final[float] = 10.0
 DEFAULT_MAX_RETRIES: Final[int] = 3
 DEFAULT_BACKOFF_BASE: Final[float] = 1.0
-USER_AGENT: Final[str] = "JobSearcher/1.0 (+https://github.com/nathanaellewong/jobsearcher)"
+PROJECT_URL: Final[str] = "https://github.com/Enoraelle/JobSearcher"
+# Sent to every third-party site this tool talks to. It carries the real
+# version rather than a literal that drifts, and the project URL rather
+# than an individual: the point of an identifiable User-Agent is that a
+# site owner who wants to reach the project can, so a URL that does not
+# resolve is worse than none.
+USER_AGENT: Final[str] = f"JobSearcher/{__version__} (+{PROJECT_URL})"
 
 # Retried with backoff by `_request`: rate limiting and server-side errors.
 # Anything else non-2xx (401, 403, 404, ...) is treated as a config problem.
@@ -116,15 +124,6 @@ class SourceRunStats:
         yielded: Number of postings successfully normalized and yielded.
         skipped: Number of raw items that failed to normalize and were
             skipped (item-level failure).
-        failed: `True` only if the source produced nothing usable this run:
-            either `fetch_raw` raised before anything could be attempted, or
-            every unit it attempted (see the module docstring's "unit-level"
-            isolation) failed. A partial failure — some units succeeded, one
-            or more didn't — leaves this `False`; check `errors` for that
-            case instead. This distinction is the point of the field: it's
-            what tells "found nothing today" (`failed=False, errors=[]`)
-            apart from "every unit is broken" (`failed=True`) apart from
-            "one unit out of many is broken" (`failed=False, errors=[...]`).
         errors: One message per failed unit (or the single message from a
             source that couldn't start at all), each naming the offending
             value and the config field it came from. Empty if nothing
@@ -133,8 +132,27 @@ class SourceRunStats:
 
     yielded: int = 0
     skipped: int = 0
-    failed: bool = False
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def failed(self) -> bool:
+        """Whether the source produced nothing usable this run.
+
+        `True` only when the run yielded no posting *and* something went
+        wrong: either it could not start at all, or every unit it attempted
+        (see the module docstring's "unit-level" isolation) failed. A
+        partial failure — some units succeeded, one or more didn't — is
+        `False`; read `errors` for that case. This distinction is the whole
+        point: it tells "found nothing today" (`failed=False, errors=[]`)
+        apart from "everything is broken" (`failed=True`) apart from "one
+        unit out of many is broken" (`failed=False, errors=[...]`).
+
+        It is derived from the counters rather than assigned at the end of a
+        run so that it reads correctly at any moment — including on a run a
+        caller abandoned part-way with `--limit`, where a trailing
+        assignment would never execute.
+        """
+        return self.yielded == 0 and bool(self.errors)
 
 
 _SourceT = TypeVar("_SourceT", bound="Source")
@@ -285,14 +303,16 @@ class Source(ABC):
             pydantic.ValidationError: If `JobPosting` construction fails.
         """
 
-    def fetch(self) -> Iterator[JobPosting]:
+    def fetch(self) -> Generator[JobPosting, None, None]:
         """Fetch and normalize postings, isolating failures (see module docstring).
 
+        Returned as a generator rather than a bare iterator so a caller that
+        stops early (``--limit``) can `close()` it and run its cleanup,
+        instead of leaving it suspended mid-request.
+
         Resets `last_run` at the start of the call and updates it as
-        iteration proceeds. `fetch()` is itself a generator: since Python
-        doesn't run generator code until it's iterated, `last_run` will
-        report the finished run's counters only once the caller has fully
-        consumed the returned iterator.
+        iteration proceeds, so its counters describe everything consumed so
+        far — including on a run the caller stops part-way through.
 
         Yields:
             Successfully normalized postings.
@@ -316,13 +336,21 @@ class Source(ABC):
                 self.last_run.yielded += 1
                 yield posting
         except SourceError as exc:
-            self.last_run.failed = True
+            # Where this surfaced says nothing about when the source broke:
+            # `fetch_raw` is a generator, so even a failure on its very first
+            # step arrives here, mid-loop. What separates "could not start"
+            # from "stopped part-way" is whether anything came out first, and
+            # that is also what `last_run.failed` keys off.
             self.last_run.errors.append(str(exc))
-            logger.error("Source %r could not start: %s", self.name, exc)
-            return
-
-        if self.last_run.yielded == 0 and self.last_run.errors:
-            self.last_run.failed = True
+            if self.last_run.yielded == 0:
+                logger.error("Source %r could not start: %s", self.name, exc)
+            else:
+                logger.error(
+                    "Source %r stopped after %d posting(s): %s",
+                    self.name,
+                    self.last_run.yielded,
+                    exc,
+                )
 
     def _record_error(self, message: str) -> None:
         """Log and record a unit-level failure on `last_run`, without raising.

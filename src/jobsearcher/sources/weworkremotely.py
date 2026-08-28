@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jobsearcher.config import PluginConfig
 from jobsearcher.models import JobPosting, WorkMode
+from jobsearcher.sources._html import strip_html
 from jobsearcher.sources.base import (
     Source,
     SourceConfigError,
@@ -64,12 +65,6 @@ _CATEGORY_FEED_URL: Final[str] = "https://weworkremotely.com/categories/{categor
 # reported as an eligibility restriction in `eligible_locations`.
 _UNRESTRICTED_REGION_MARKERS: Final[frozenset[str]] = frozenset(
     {"anywhere in the world", "anywhere", "worldwide"}
-)
-
-# Block-level tags that should introduce a line break when extracting plain
-# text from HTML, so adjacent block elements don't run together.
-_BLOCK_TAGS: Final[frozenset[str]] = frozenset(
-    {"p", "div", "br", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
 )
 
 # We Work Remotely's job detail pages wrap the full posting description in a
@@ -94,39 +89,6 @@ class WeWorkRemotelySourceConfig(BaseModel):
     feeds: list[str] = Field(default_factory=lambda: [_MAIN_FEED_NAME], min_length=1)
     fetch_full_description: bool = False
     max_postings_per_feed: int | None = Field(default=None, ge=1)
-
-
-class _HTMLTextExtractor(HTMLParser):
-    """Extracts plain text from HTML, inserting line breaks at block tags."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._chunks: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _BLOCK_TAGS:
-            self._chunks.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in _BLOCK_TAGS:
-            self._chunks.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        self._chunks.append(data)
-
-    def get_text(self) -> str:
-        return "".join(self._chunks)
-
-
-def _strip_html(html_content: str) -> str:
-    """Convert an HTML description into cleaned-up plain text."""
-    if not html_content.strip():
-        return ""
-    extractor = _HTMLTextExtractor()
-    extractor.feed(html_content)
-    extractor.close()
-    lines = (line.strip() for line in extractor.get_text().splitlines())
-    return "\n".join(line for line in lines if line)
 
 
 class _ListingContainerExtractor(HTMLParser):
@@ -369,7 +331,7 @@ class WeWorkRemotelySource(Source):
             full_description = self._fetch_full_description(raw["link"])
             if full_description is not None:
                 description_raw = full_description
-        description_clean = _strip_html(description_raw)
+        description_clean = strip_html(description_raw)
 
         region = raw.get("region")
 

@@ -20,11 +20,14 @@ file — see the "File vs. package" convention in CLAUDE.md.
 
 from __future__ import annotations
 
+import re
 import unicodedata
-from typing import Protocol
+from typing import Final, Protocol
 
 from jobsearcher.config import ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult, WorkMode
+
+_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-z]+")
 
 
 class ScorerBudgetExhaustedError(Exception):
@@ -66,8 +69,40 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
+def _place_tokens(text: str) -> tuple[str, ...]:
+    """Split a place name into comparable word tokens.
+
+    Folding first means case, accents and punctuation stop mattering:
+    ``"Île-de-France"`` and ``"Ile de France"`` both become
+    ``("ile", "de", "france")``.
+    """
+    return tuple(_WORD_RE.findall(_fold(text)))
+
+
+def _contains_phrase(haystack: tuple[str, ...], needle: tuple[str, ...]) -> bool:
+    """Whether ``needle`` occurs in ``haystack`` as a run of whole tokens."""
+    if not needle or len(needle) > len(haystack):
+        return False
+    span = len(needle)
+    return any(haystack[i : i + span] == needle for i in range(len(haystack) - span + 1))
+
+
 def evaluate_location_match(posting: JobPosting, profile: ProfileConfig) -> bool | None:
     """Whether the posting's location is compatible with the profile's.
+
+    Comparison is on whole tokens, not on substrings. A plain substring test
+    reports a match whenever one name's letters happen to occur inside
+    another's — ``"US"`` inside ``"Toulouse"``, ``"IN"`` inside
+    ``"Berlin"``, ``"Nice"`` inside ``"Venice"`` — and country codes, the
+    shortest and most common thing to configure, are exactly where it goes
+    wrong most. This field is read as an answer to "can I take this job", so
+    a wrong ``True`` costs more than the ``None`` that means "cannot tell":
+    it puts an unreachable posting on the shortlist wearing the look of a
+    checked fact.
+
+    Matching stays deliberately two-directional: a configured ``"France"``
+    matches a posting in ``"Paris, France"``, and a configured
+    ``"Remote - EU"`` matches a posting that only says ``"EU"``.
 
     Args:
         posting: The posting whose ``location`` and ``eligible_locations``
@@ -77,20 +112,22 @@ def evaluate_location_match(posting: JobPosting, profile: ProfileConfig) -> bool
     Returns:
         ``None`` if the profile lists no locations, or the posting carries
         neither a ``location`` nor any ``eligible_locations`` (nothing to
-        compare). Otherwise ``True`` if any configured location, compared
-        case- and accent-insensitively, is a substring of — or contains —
-        the posting's location or one of its eligible locations, and
-        ``False`` if none do.
+        compare). Otherwise ``True`` if any configured location and any of
+        the posting's locations contain one another as a run of whole
+        tokens, and ``False`` if none do.
     """
     if not profile.locations:
         return None
     candidates = [loc for loc in (posting.location, *posting.eligible_locations) if loc]
     if not candidates:
         return None
-    folded_candidates = [_fold(c) for c in candidates]
+    candidate_tokens = [_place_tokens(c) for c in candidates]
     for wanted in profile.locations:
-        folded = _fold(wanted)
-        if any(folded in candidate or candidate in folded for candidate in folded_candidates):
+        wanted_tokens = _place_tokens(wanted)
+        if any(
+            _contains_phrase(candidate, wanted_tokens) or _contains_phrase(wanted_tokens, candidate)
+            for candidate in candidate_tokens
+        ):
             return True
     return False
 

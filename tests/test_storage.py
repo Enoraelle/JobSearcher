@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,9 @@ from typing import Any
 
 import pytest
 
+from jobsearcher.config import BackendSectionConfig
 from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode, posting_id
+from jobsearcher.storage import StorageConfigError, open_storage
 from jobsearcher.storage.sqlite import _MIGRATIONS, CURRENT_SCHEMA_VERSION, SqliteStorage
 
 
@@ -533,3 +536,445 @@ def _v1_row() -> tuple[Any, ...]:
         "new",
         None,
     )
+
+
+# --------------------------------------------------------------------------
+# The three ways the database can become unusable
+# --------------------------------------------------------------------------
+
+
+def test_opening_a_path_in_a_missing_directory_is_a_config_error(tmp_path: Path) -> None:
+    """`storage.path: ./data/jobs.db` with no ./data must not be a traceback.
+
+    sqlite3 raises OperationalError here; every command opens storage, so an
+    unhandled one takes the whole CLI down on an ordinary config.
+    """
+    config = BackendSectionConfig(backend="sqlite", path=str(tmp_path / "missing" / "jobs.db"))
+
+    with pytest.raises(StorageConfigError) as excinfo:
+        open_storage(config)
+
+    message = str(excinfo.value)
+    assert "storage.path" in message
+    assert "missing" in message
+
+
+def test_opening_a_file_that_is_not_a_database_is_a_config_error(tmp_path: Path) -> None:
+    not_a_db = tmp_path / "jobs.db"
+    not_a_db.write_bytes(b"this is definitely not a SQLite file" * 64)
+    config = BackendSectionConfig(backend="sqlite", path=str(not_a_db))
+
+    with pytest.raises(StorageConfigError):
+        open_storage(config)
+
+
+def test_an_interrupted_migration_leaves_the_database_openable(db_path: Path) -> None:
+    """A migration that dies halfway must roll back, not half-apply.
+
+    Without a transaction per version, sqlite3 auto-commits each DDL
+    statement while `schema_version` stays behind, so the next open replays
+    the batch against a schema that has already moved and fails forever.
+    """
+    with SqliteStorage(db_path) as storage:
+        storage.save_many([_make_posting(url="https://example.com/jobs/keep-me")])
+
+    doomed = (
+        "ALTER TABLE postings ADD COLUMN experiment TEXT",
+        "ALTER TABLE postings ADD COLUMN experiment TEXT",  # duplicate: fails
+    )
+    original = dict(_MIGRATIONS)
+    _MIGRATIONS[CURRENT_SCHEMA_VERSION + 1] = doomed
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            SqliteStorage(db_path)
+    finally:
+        _MIGRATIONS.clear()
+        _MIGRATIONS.update(original)
+
+    # The failed batch left nothing behind, so the store still opens.
+    with SqliteStorage(db_path) as storage:
+        stored = storage.get_by_url("https://example.com/jobs/keep-me")
+        assert stored is not None
+
+    connection = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(postings)")}
+        version = connection.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert "experiment" not in columns
+    assert int(version[0]) == CURRENT_SCHEMA_VERSION
+
+
+def test_a_legacy_row_with_an_unusable_url_does_not_block_opening(db_path: Path) -> None:
+    """The id backfill must skip a row it cannot hash, not refuse to open.
+
+    `posting_id` normalizes the URL first and raises on a relative one. A
+    single such legacy row used to make every command fail with no way to
+    reach the database and repair it.
+    """
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        for statement in _MIGRATIONS[1]:
+            connection.execute(statement)
+        connection.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+        for url in ("/relative/path", "https://example.com/jobs/good"):
+            row = list(_v1_row())
+            row[_v1_columns().index("url")] = url
+            row[_v1_columns().index("raw_url")] = url
+            connection.execute(
+                f"INSERT INTO postings ({', '.join(_v1_columns())}) "
+                f"VALUES ({', '.join('?' for _ in _v1_columns())})",
+                tuple(row),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SqliteStorage(db_path) as storage:
+        good = storage.get_by_url("https://example.com/jobs/good")
+        assert good is not None
+        assert good.id == posting_id("https://example.com/jobs/good")
+
+    # The unusable row keeps a NULL id rather than blocking the backfill.
+    check = sqlite3.connect(db_path)
+    try:
+        ids = dict(check.execute("SELECT url, id FROM postings").fetchall())
+    finally:
+        check.close()
+    assert ids["/relative/path"] is None
+    assert ids["https://example.com/jobs/good"] is not None
+
+
+# --------------------------------------------------------------------------
+# Paging, and what idempotent insertion actually preserves
+# --------------------------------------------------------------------------
+
+
+def test_offset_without_limit_still_skips(storage: SqliteStorage) -> None:
+    """`offset` is a public parameter; ignoring it silently is worse than failing."""
+    storage.save_many([_make_posting(url=f"https://example.com/jobs/{i}") for i in range(5)])
+
+    assert len(storage.list(offset=3)) == 2
+    assert len(storage.list(offset=5)) == 0
+    assert len(storage.list(offset=99)) == 0
+    assert len(storage.list()) == 5
+
+
+def test_offset_without_limit_pages_consistently(storage: SqliteStorage) -> None:
+    storage.save_many(
+        [
+            _make_posting(
+                url=f"https://example.com/jobs/{i}",
+                fetched_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(hours=i),
+            )
+            for i in range(5)
+        ]
+    )
+
+    everything = [posting.url for posting in storage.list()]
+    tail = [posting.url for posting in storage.list(offset=2)]
+
+    assert tail == everything[2:]
+
+
+def test_the_same_job_under_two_tracking_urls_is_stored_once(storage: SqliteStorage) -> None:
+    """Deduplication is by *normalized* URL, which is the point of normalizing.
+
+    Two sources linking the same posting with different campaign parameters
+    must not produce two rows the user has to read twice.
+    """
+    inserted_first = storage.save_many(
+        [_make_posting(url="https://example.com/jobs/42?utm_source=newsletter")]
+    )
+    inserted_second = storage.save_many(
+        [_make_posting(url="https://example.com/jobs/42?utm_source=twitter&gclid=abc")]
+    )
+
+    assert inserted_first == 1
+    assert inserted_second == 0
+    assert storage.count() == 1
+    assert storage.get_by_url("https://example.com/jobs/42") is not None
+
+
+def test_reinsertion_preserves_application_tracking_and_score_detail(
+    storage: SqliteStorage,
+) -> None:
+    """A rescrape must not roll back where a posting stands in the pipeline.
+
+    `save_many` protects the score; status, applied_at and the score's
+    supporting detail are just as much the user's own work, and a source
+    that re-emits the posting knows nothing about any of them.
+    """
+    url = "https://example.com/jobs/tracked"
+    storage.save_many([_make_posting(url=url, title="Original title")])
+    storage.update_score(
+        url,
+        score=77,
+        summary="matched 2/2 skills",
+        matched_skills=["python", "django"],
+        unmatched_profile_skills=["celery"],
+        missing_requirements=["kubernetes"],
+        penalized_skills=["php"],
+        location_match=True,
+        work_mode_match=False,
+    )
+    applied_at = datetime(2026, 3, 4, tzinfo=UTC)
+    storage.update_status(url, ApplicationStatus.APPLIED, applied_at=applied_at)
+
+    reinserted = storage.save_many(
+        [
+            _make_posting(
+                url=url,
+                title="Rescraped title",
+                status=ApplicationStatus.NEW,
+                score=None,
+            )
+        ]
+    )
+
+    assert reinserted == 0
+    stored = storage.get_by_url(url)
+    assert stored is not None
+    assert stored.title == "Original title"
+    assert stored.score == 77
+    assert stored.summary == "matched 2/2 skills"
+    assert stored.matched_skills == ["python", "django"]
+    assert stored.unmatched_profile_skills == ["celery"]
+    assert stored.missing_requirements == ["kubernetes"]
+    assert stored.penalized_skills == ["php"]
+    assert stored.location_match is True
+    assert stored.work_mode_match is False
+    assert stored.status is ApplicationStatus.APPLIED
+    assert stored.applied_at == applied_at
+
+
+def test_save_many_counts_only_the_new_rows_in_a_mixed_batch(storage: SqliteStorage) -> None:
+    """The count drives the CLI's "new" and "dupes" columns."""
+    storage.save_many([_make_posting(url="https://example.com/jobs/known")])
+
+    inserted = storage.save_many(
+        [
+            _make_posting(url="https://example.com/jobs/new-1"),
+            _make_posting(url="https://example.com/jobs/known"),
+            _make_posting(url="https://example.com/jobs/new-2"),
+        ]
+    )
+
+    assert inserted == 2
+    assert storage.count() == 3
+
+
+def test_a_batch_containing_the_same_url_twice_inserts_it_once(storage: SqliteStorage) -> None:
+    inserted = storage.save_many(
+        [
+            _make_posting(url="https://example.com/jobs/same"),
+            _make_posting(url="https://example.com/jobs/same?utm_medium=email"),
+        ]
+    )
+
+    assert inserted == 1
+    assert storage.count() == 1
+
+
+def test_reopening_an_already_migrated_database_is_a_no_op(db_path: Path) -> None:
+    """Opening is on the path of every command; it must be idempotent."""
+    with SqliteStorage(db_path) as storage:
+        storage.save_many([_make_posting(url="https://example.com/jobs/persisted")])
+        first_id = storage.get_by_url("https://example.com/jobs/persisted")
+
+    for _ in range(3):
+        with SqliteStorage(db_path) as storage:
+            again = storage.get_by_url("https://example.com/jobs/persisted")
+            assert again == first_id
+            assert storage.count() == 1
+
+    connection = sqlite3.connect(db_path)
+    try:
+        versions = connection.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert len(versions) == 1
+    assert int(versions[0][0]) == CURRENT_SCHEMA_VERSION
+
+
+# --------------------------------------------------------------------------
+# An unreadable stored row must cost that row, and nothing else
+# --------------------------------------------------------------------------
+#
+# A row can stop decoding for reasons no command can fix from the outside: an
+# enum value written by a future version, a URL some earlier version stored
+# relative, hand-editing. Letting it raise takes down `list` - the command the
+# whole tool is used through. Dropping it quietly is worse still, so every
+# read counts what it had to skip.
+
+
+def _corrupt_column(db_path: Path, url: str, column: str, value: Any) -> None:
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(f"UPDATE postings SET {column} = ? WHERE url = ?", (value, url))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("url", "/relative/path"),  # fails the model's URL validator
+        ("work_mode", "teleportation"),  # not a WorkMode
+        ("status", "ghosted"),  # not an ApplicationStatus
+        ("fetched_at", "not a date"),
+        ("published_at", "the third of never"),
+        ("eligible_locations", "{not json"),
+        ("matched_skills", "{not json"),
+        ("title", ""),  # blank identity field
+    ],
+)
+def test_an_unreadable_row_is_skipped_rather_than_raising(
+    db_path: Path, column: str, value: Any
+) -> None:
+    with SqliteStorage(db_path) as storage:
+        storage.save_many(
+            [
+                _make_posting(url="https://example.com/jobs/broken", title="Broken"),
+                _make_posting(url="https://example.com/jobs/fine", title="Fine"),
+            ]
+        )
+    _corrupt_column(db_path, "https://example.com/jobs/broken", column, value)
+
+    with SqliteStorage(db_path) as storage:
+        postings = storage.list()
+
+        assert [posting.title for posting in postings] == ["Fine"]
+        assert storage.unreadable_rows == 1
+
+
+def test_the_number_of_unreadable_rows_is_reported_per_read(db_path: Path) -> None:
+    with SqliteStorage(db_path) as storage:
+        storage.save_many(
+            [_make_posting(url=f"https://example.com/jobs/{index}") for index in range(4)]
+        )
+    for index in (0, 1, 2):
+        _corrupt_column(db_path, f"https://example.com/jobs/{index}", "work_mode", "nope")
+
+    with SqliteStorage(db_path) as storage:
+        assert len(storage.list()) == 1
+        assert storage.unreadable_rows == 3
+
+        # The counter describes the latest read, not the lifetime of the handle.
+        assert len(storage.list(source="nobody")) == 0
+        assert storage.unreadable_rows == 0
+
+        assert len(storage.list()) == 1
+        assert storage.unreadable_rows == 3
+
+
+def test_an_unreadable_row_is_logged_with_its_id_and_url(
+    db_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The log is the only place the lost row can be identified from."""
+    url = "https://example.com/jobs/broken"
+    with SqliteStorage(db_path) as storage:
+        storage.save_many([_make_posting(url=url)])
+    expected_id = posting_id(url)
+    _corrupt_column(db_path, url, "work_mode", "teleportation")
+
+    with caplog.at_level(logging.WARNING), SqliteStorage(db_path) as storage:
+        storage.list()
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert expected_id in message
+    assert url in message
+    assert "teleportation" in message
+
+
+def test_get_by_url_on_an_unreadable_row_reports_rather_than_raising(db_path: Path) -> None:
+    url = "https://example.com/jobs/broken"
+    with SqliteStorage(db_path) as storage:
+        storage.save_many([_make_posting(url=url)])
+    _corrupt_column(db_path, url, "status", "ghosted")
+
+    with SqliteStorage(db_path) as storage:
+        assert storage.get_by_url(url) is None
+        assert storage.unreadable_rows == 1
+
+
+def test_find_by_id_prefix_on_an_unreadable_row_reports_rather_than_raising(
+    db_path: Path,
+) -> None:
+    url = "https://example.com/jobs/broken"
+    with SqliteStorage(db_path) as storage:
+        storage.save_many([_make_posting(url=url)])
+    prefix = posting_id(url)[:8]
+    _corrupt_column(db_path, url, "fetched_at", "not a date")
+
+    with SqliteStorage(db_path) as storage:
+        assert storage.find_by_id_prefix(prefix) == []
+        assert storage.unreadable_rows == 1
+
+
+def test_count_still_sees_a_row_that_cannot_be_decoded(db_path: Path) -> None:
+    """`count` is pure SQL: it counts what is stored, not what is readable.
+
+    The gap between `count` and `len(list())` is exactly what the reported
+    number of unreadable rows explains.
+    """
+    with SqliteStorage(db_path) as storage:
+        storage.save_many(
+            [
+                _make_posting(url="https://example.com/jobs/broken"),
+                _make_posting(url="https://example.com/jobs/fine"),
+            ]
+        )
+    _corrupt_column(db_path, "https://example.com/jobs/broken", "work_mode", "nope")
+
+    with SqliteStorage(db_path) as storage:
+        assert storage.count() == 2
+        assert len(storage.list()) == 1
+        assert storage.unreadable_rows == 1
+
+
+def test_a_legacy_row_with_an_unusable_url_is_skipped_by_list_too(db_path: Path) -> None:
+    """The other half of the backfill fix: opening works, and so does reading.
+
+    A row the id backfill had to skip is exactly a row `list` cannot decode.
+    Fixing only the open would move the crash to the most-used command.
+    """
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        for statement in _MIGRATIONS[1]:
+            connection.execute(statement)
+        connection.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+        for url in ("/relative/path", "https://example.com/jobs/good"):
+            row = list(_v1_row())
+            row[_v1_columns().index("url")] = url
+            row[_v1_columns().index("raw_url")] = url
+            connection.execute(
+                f"INSERT INTO postings ({', '.join(_v1_columns())}) "
+                f"VALUES ({', '.join('?' for _ in _v1_columns())})",
+                tuple(row),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SqliteStorage(db_path) as storage:
+        postings = storage.list()
+
+        assert [posting.url for posting in postings] == ["https://example.com/jobs/good"]
+        assert storage.unreadable_rows == 1
+        assert storage.count() == 2

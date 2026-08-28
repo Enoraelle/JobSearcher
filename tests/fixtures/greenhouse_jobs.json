@@ -10,7 +10,7 @@
       "location": {
         "name": "Remote - US"
       },
-      "content": "<p>We build the platform that powers our product.</p><p><strong>Requirements</strong></p><ul><li>5+ years of Python</li><li>Experience with distributed systems</li></ul><p>Only candidates in United States will be considered.</p>",
+      "content": "&lt;p&gt;We build the platform that powers our product.&lt;/p&gt;&lt;p&gt;&lt;strong&gt;Requirements&lt;/strong&gt;&lt;/p&gt;&lt;ul&gt;&lt;li&gt;5+ years of Python&lt;/li&gt;&lt;li&gt;Experience with distributed systems&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;Only candidates in United States will be considered.&lt;/p&gt;",
       "departments": [
         {
           "id": 1,
@@ -32,7 +32,7 @@
       "location": {
         "name": "Paris, France"
       },
-      "content": "<p>Missing a title field on purpose to exercise the malformed-item path.</p>",
+      "content": "&lt;p&gt;Missing a title field on purpose to exercise the malformed-item path.&lt;/p&gt;",
       "departments": [
         {
           "id": 2,
@@ -51,7 +51,7 @@
       "location": {
         "name": "Berlin, Germany"
       },
-      "content": "<p>Hybrid role based in our Berlin office.</p><p>Must be based in Germany.</p>",
+      "content": "&lt;p&gt;Hybrid role based in our Berlin office.&lt;/p&gt;&lt;p&gt;Must be based in Germany.&lt;/p&gt;",
       "departments": [
         {
           "id": 3,

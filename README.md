@@ -386,6 +386,17 @@ score is never silently clobbered by a rescrape.
   language filter.
 - **Deduplication is per normalized URL.** The same job cross-posted to two
   sources under two URLs is stored twice.
+- **There is no database repair command.** A stored row that can no longer
+  be decoded — a value written by a newer version of JobSearcher, a
+  hand-edited database, a file damaged by a crash mid-write — is skipped by
+  reads rather than allowed to take the command down. The row stays in the
+  database, `jobsearcher list` and `jobsearcher export` report how many rows
+  they had to skip, and each one's id and URL is logged. Nothing can mend
+  it, though: the recourse is to delete the database file (`storage.path`,
+  `./jobsearcher.db` by default) and collect again. Deleting it also
+  discards every score and every application status you had recorded, so
+  export what you care about first — `jobsearcher export json` reads through
+  the same skip-and-report path and will save everything still readable.
 
 ## License
 

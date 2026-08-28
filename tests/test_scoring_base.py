@@ -84,3 +84,78 @@ class TestWorkModeMatch:
         posting = _posting(work_mode=posting_mode)
         profile = _profile(work_mode=profile_mode)
         assert evaluate_work_mode_match(posting, profile) is expected
+
+
+# --------------------------------------------------------------------------
+# Location matching must compare places, not letters
+# --------------------------------------------------------------------------
+#
+# This field answers "can I take this job". A wrong True is more expensive
+# than a None: it puts an unreachable posting on the shortlist and reads as
+# a checked fact rather than a guess.
+
+
+@pytest.mark.parametrize(
+    ("wanted", "location"),
+    [
+        ("US", "Toulouse"),  # the country code hides inside a city name
+        ("US", "Poland, Russia and Belarus"),
+        ("EU", "Seoul"),
+        ("IN", "Berlin"),
+        ("UK", "Krakow"),
+        ("Nice", "Venice"),
+        ("Bern", "Canberra"),
+    ],
+)
+def test_a_location_is_not_matched_by_a_substring_of_another_word(
+    wanted: str, location: str
+) -> None:
+    result = evaluate_location_match(_posting(location=location), _profile(locations=[wanted]))
+
+    assert result is False
+
+
+@pytest.mark.parametrize(
+    ("wanted", "location"),
+    [
+        ("France", "Paris, France"),
+        ("france", "PARIS, FRANCE"),
+        ("Ile-de-France", "Ile-de-France"),
+        ("Île-de-France", "Ile de France"),  # accents and punctuation fold away
+        ("US", "Remote - US"),
+        ("US", "US"),
+        ("United States", "Remote - United States only"),
+        ("Remote - EU", "EU"),  # the configured phrase contains the posting's
+    ],
+)
+def test_a_location_still_matches_on_whole_tokens(wanted: str, location: str) -> None:
+    result = evaluate_location_match(_posting(location=location), _profile(locations=[wanted]))
+
+    assert result is True
+
+
+def test_a_multi_word_location_matches_as_a_phrase_not_as_loose_words() -> None:
+    """ "New York" must not be matched by "York, England"."""
+    assert (
+        evaluate_location_match(
+            _posting(location="York, England"), _profile(locations=["New York"])
+        )
+        is False
+    )
+    assert (
+        evaluate_location_match(_posting(location="New York, NY"), _profile(locations=["New York"]))
+        is True
+    )
+
+
+def test_eligible_locations_are_matched_on_tokens_too() -> None:
+    posting = _posting(location=None, eligible_locations=["Toulouse"])
+
+    assert evaluate_location_match(posting, _profile(locations=["US"])) is False
+    assert evaluate_location_match(posting, _profile(locations=["Toulouse"])) is True
+
+
+def test_no_comparable_location_is_still_unknown_not_false() -> None:
+    """The distinction between "does not fit" and "does not say" is preserved."""
+    assert evaluate_location_match(_posting(location=None), _profile(locations=["US"])) is None
+    assert evaluate_location_match(_posting(location="Toulouse"), _profile()) is None

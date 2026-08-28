@@ -8,6 +8,7 @@ registered in ``conftest.py``.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -286,3 +287,225 @@ def test_run_executes_all_phases(runner: CliRunner) -> None:
 
     listed = json.loads(_invoke(runner, "list", "--json").output)
     assert all(row["score"] is not None for row in listed)
+
+
+# --------------------------------------------------------------------------
+# Rendering of untrusted posting text
+# --------------------------------------------------------------------------
+#
+# Titles and descriptions come from scraped web pages. Rich treats `[...]` as
+# markup, which fails two ways: a stray closing tag raises MarkupError (a
+# traceback, when the CLI promises an exit code), and a well-formed tag is
+# consumed silently, deleting text from the table nobody will notice is gone.
+
+_MARKUP_TITLES = (
+    "[/b] Backend Engineer",  # stray closing tag -> MarkupError
+    "Dev [bold]role",  # opening tag -> silently swallowed
+    "C++ [red]team[/red] lead",  # balanced pair -> silently swallowed
+    "Engineer [not-a-style] wanted",
+)
+
+
+def test_list_renders_markup_metacharacters_in_titles_literally(runner: CliRunner) -> None:
+    _write_config(sources=_fake_source(*_MARKUP_TITLES))
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "list")
+
+    assert result.exit_code == 0, result.output
+    # Nothing may be dropped: every bracketed fragment survives on screen.
+    assert "[/b]" in result.output
+    assert "[bold]" in result.output
+    assert "[red]" in result.output
+    assert "[not-a-style]" in result.output
+
+
+def test_show_renders_markup_metacharacters_in_title_and_description(
+    runner: CliRunner,
+) -> None:
+    hostile = "Ops [/b] Engineer"
+    description = "You will own [deploys] and [/rollbacks] end to end."
+    _write_config(
+        sources={
+            "fake": {
+                "enabled": True,
+                "postings": [
+                    {
+                        "url": "https://jobs.test/markup",
+                        "title": hostile,
+                        "description": description,
+                    }
+                ],
+            }
+        }
+    )
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "show", "https://jobs.test/markup")
+
+    assert result.exit_code == 0, result.output
+    assert "[/b]" in result.output
+    assert "[deploys]" in result.output
+    assert "[/rollbacks]" in result.output
+
+
+def test_score_failure_report_renders_a_markup_title_literally(runner: CliRunner) -> None:
+    """The failed-posting list in `score` prints titles too."""
+    _write_config(sources=_fake_source("[/i] Data Engineer"))
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "list", "--json")
+
+    assert result.exit_code == 0, result.output
+    assert "[/i] Data Engineer" in json.loads(result.output)[0]["title"]
+
+
+def test_a_storage_path_in_a_missing_directory_fails_cleanly(runner: CliRunner) -> None:
+    """`path: ./data/jobs.db` with no ./data is an ordinary config mistake.
+
+    It must produce the CLI's documented exit 1 and an actionable message,
+    not a sqlite3 traceback out of every single command.
+    """
+    _write_config(storage={"backend": "sqlite", "path": "./data/jobs.db"})
+
+    for command in (["list"], ["fetch"], ["score"], ["export", "markdown"]):
+        result = _invoke(runner, *command)
+
+        assert result.exit_code == 1, (command, result.output)
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "storage.path" in result.output
+        assert "Traceback" not in result.output
+
+
+# --------------------------------------------------------------------------
+# Rows that cannot be read must be counted out loud
+# --------------------------------------------------------------------------
+
+
+def _corrupt_one_stored_row(column: str = "work_mode", value: str = "teleportation") -> str:
+    """Break one stored row in place and return its url."""
+    connection = sqlite3.connect("jobsearcher.db")
+    try:
+        (url,) = connection.execute("SELECT url FROM postings ORDER BY url LIMIT 1").fetchone()
+        connection.execute(f"UPDATE postings SET {column} = ? WHERE url = ?", (value, url))
+        connection.commit()
+    finally:
+        connection.close()
+    return str(url)
+
+
+def test_list_reports_rows_it_could_not_read(runner: CliRunner) -> None:
+    """Skipping a broken row silently is the failure this whole pass is about."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = _invoke(runner, "list")
+
+    assert result.exit_code == 0, result.output
+    assert "1 stored row" in result.output
+    assert "could not be read" in result.output
+    # The readable one is still shown.
+    assert "Django Developer" in result.output
+
+
+def test_list_says_nothing_when_every_row_reads(runner: CliRunner) -> None:
+    _write_config(sources=_fake_source("Backend Engineer"))
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "list")
+
+    assert "could not be read" not in result.output
+
+
+def test_list_json_reports_unreadable_rows_on_stderr_only(runner: CliRunner) -> None:
+    """`list --json` must stay pipeable, so the warning goes to stderr."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = runner.invoke(
+        main, ["list", "--json"], env=_WIDE_ENV, catch_exceptions=False, color=False
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert len(payload) == 1
+
+
+def test_show_does_not_claim_a_broken_posting_is_absent(runner: CliRunner) -> None:
+    """ "No posting matches" would be a lie, and the exact bug moved elsewhere."""
+    _write_config(sources=_fake_source("Backend Engineer"))
+    _invoke(runner, "fetch")
+    url = _corrupt_one_stored_row()
+
+    result = _invoke(runner, "show", url)
+
+    assert result.exit_code == 1
+    assert "could not be read" in result.output
+    assert "no posting" not in result.output.casefold()
+    # The hint continues the sentence naming the ref; it must not restate
+    # the subject ("The posting at '...' it is stored but...").
+    assert f"The posting at {url!r} is stored" in result.output
+
+
+def test_export_reports_rows_it_could_not_read(runner: CliRunner) -> None:
+    """An export silently short a row is the same silent loss, in a file."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = _invoke(runner, "export", "markdown")
+
+    assert result.exit_code == 0, result.output
+    assert "1 stored row" in result.output
+    assert "could not be read" in result.output
+
+
+def test_run_reports_rows_it_could_not_read(runner: CliRunner) -> None:
+    """`run` is the cron entry point: nobody is watching while it works."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = _invoke(runner, "run", "--skip-fetch")
+
+    assert result.exit_code == 0, result.output
+    assert "1 stored row" in result.output
+    assert "could not be read" in result.output
+
+
+def test_run_reports_them_from_the_score_phase_when_export_is_skipped(
+    runner: CliRunner,
+) -> None:
+    """`run --skip-score`-style cron shapes must not lose the report."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = _invoke(runner, "run", "--skip-fetch", "--skip-export")
+
+    assert result.exit_code == 0, result.output
+    assert "1 stored row" in result.output
+    assert "could not be read" in result.output
+
+
+def test_run_says_nothing_when_every_row_reads(runner: CliRunner) -> None:
+    _write_config(sources=_fake_source("Backend Engineer"))
+
+    result = _invoke(runner, "run")
+
+    assert result.exit_code == 0, result.output
+    assert "could not be read" not in result.output
+
+
+def test_run_still_succeeds_despite_an_unreadable_row(runner: CliRunner) -> None:
+    """A skipped row is reported, not promoted to a phase failure."""
+    _write_config(sources=_fake_source("Backend Engineer", "Django Developer"))
+    _invoke(runner, "fetch")
+    _corrupt_one_stored_row()
+
+    result = _invoke(runner, "run", "--skip-fetch")
+
+    assert result.exit_code == 0
+    assert "wrote 1 postings" in result.output

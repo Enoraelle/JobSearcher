@@ -5,6 +5,14 @@ its own: :mod:`jobsearcher.pipeline` orchestrates fetch/score/export, and
 the storage, scoring and exporter packages do the work. Everything here is
 about parsing arguments, rendering results, and choosing exit codes.
 
+Everything a posting carries - title, company, description, and any
+error message quoting them - reaches this module as scraped text, and
+Rich reads ``[...]`` as markup. Such values are therefore never
+interpolated into a markup string: they go through :func:`_plain`, which
+wraps them in a :class:`~rich.text.Text` that Rich renders literally.
+Skipping that turns a posting title into either a ``MarkupError``
+traceback or, worse, silently deleted text.
+
 Output is written with :mod:`rich`: progress bars on the long phases,
 aligned tables, and a small palette (``cyan`` / ``green`` / ``yellow`` /
 ``red`` / ``dim``) chosen to stay readable on both light and dark
@@ -39,6 +47,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
+from rich.text import Text
 
 from jobsearcher import __version__
 from jobsearcher.config import (
@@ -273,9 +282,19 @@ def score(ctx: AppContext, limit: int | None, rescore: bool) -> None:
     if failed:
         _err.print(f"[yellow]{len(failed)} posting(s) could not be scored:[/yellow]")
         for row in failed:
-            _err.print(f"  [dim]{row.posting.id[:8]}[/dim] {row.posting.title} - {row.reason}")
+            _err.print(
+                Text.assemble(
+                    "  ",
+                    (row.posting.id[:8], "dim"),
+                    " ",
+                    row.posting.title,
+                    " - ",
+                    row.reason or "",
+                )
+            )
     if stopped:
         _out.print("[yellow]Scorer budget reached[/yellow]; run again to score the rest.")
+    _print_unreadable(pipeline.last_score_unreadable, what="the scoring phase")
 
 
 # --------------------------------------------------------------------------
@@ -335,6 +354,7 @@ def list_postings(
             scored=False if unscored else None,
             languages=resolved_languages,
         )
+        _report_unreadable(storage)
 
     if remote:
         postings = [p for p in postings if p.work_mode is WorkMode.REMOTE]
@@ -494,6 +514,7 @@ def run(
         _out.print(f"{verb.capitalize()} {report.score.scored}, failed {report.score.failed}.")
         if report.score.stopped_early:
             _out.print("[yellow]Scorer budget reached[/yellow]; run again to finish.")
+        _print_unreadable(report.score.unreadable, what="the scoring phase")
     if report.export:
         _out.rule("export")
         _render_export(report.export, dry_run=ctx.dry_run)
@@ -527,6 +548,58 @@ def _phase_progress(label: str, *, total: int) -> Iterator[tuple[Progress, TaskI
         yield progress, task
 
 
+def _print_unreadable(count: int, *, what: str) -> None:
+    """Say how many stored rows a read had to skip, if any.
+
+    Storage skips a row it cannot decode rather than letting one bad row
+    take down the command (see
+    :meth:`~jobsearcher.storage.sqlite.SqliteStorage.unreadable_rows`). That
+    is only acceptable while it is said out loud: a row missing with nothing
+    to show for it is worse than the crash it replaced, because nobody goes
+    looking for what they were not told is gone. It matters most in `run`,
+    which is built to be put in a cron and therefore the one command nobody
+    is reading while it works.
+
+    Written to stderr so `list --json` stays pipeable.
+
+    Args:
+        count: How many rows were skipped; nothing is printed for zero.
+        what: What the skipped rows are missing from, e.g. ``"these
+            results"`` or ``"the export"``.
+    """
+    if count:
+        _err.print(
+            f"[yellow]{count} stored row(s) could not be read[/yellow] and are missing "
+            f"from {what}; see the log above for which, and the README's "
+            f"Limitations for what can be done about it."
+        )
+
+
+def _report_unreadable(storage: SqliteStorage) -> None:
+    """Report on the storage handle's most recent read (see `_print_unreadable`)."""
+    _print_unreadable(storage.unreadable_rows, what="these results")
+
+
+def _plain(value: str, style: str = "") -> Text:
+    """Wrap posting-derived text so Rich renders it literally.
+
+    Titles, companies, locations and descriptions come from scraped pages,
+    where ``[`` is an ordinary character. Rich reads it as the start of a
+    style tag, which either raises ``MarkupError`` on an unmatched closing
+    tag or - the quieter failure - swallows a well-formed one and drops the
+    text from the output with nothing to show that anything went missing.
+
+    Args:
+        value: The untrusted text.
+        style: An optional Rich style applied to the whole run, replacing
+            the inline markup that would otherwise have wrapped it.
+
+    Returns:
+        A ``Text`` carrying ``value`` verbatim.
+    """
+    return Text(value, style=style)
+
+
 def _score_style(value: int | None) -> str:
     if value is None:
         return "dim"
@@ -550,7 +623,7 @@ def _render_fetch_table(results: list[SourceFetchResult], *, dry_run: bool) -> N
         stored = "-" if dry_run else str(result.stored)
         dupes = "-" if dry_run else str(result.duplicates)
         table.add_row(
-            f"[red]{result.source}[/red]" if result.failed else result.source,
+            _plain(result.source, "red" if result.failed else ""),
             str(result.yielded),
             str(result.kept),
             str(result.filtered_out),
@@ -561,7 +634,7 @@ def _render_fetch_table(results: list[SourceFetchResult], *, dry_run: bool) -> N
     _out.print(table)
     for result in results:
         for message in result.errors:
-            _err.print(f"[red]{result.source}:[/red] {message}")
+            _err.print(Text.assemble((f"{result.source}:", "red"), " ", message))
 
 
 def _sorted_postings(postings: list[JobPosting], sort: str) -> list[JobPosting]:
@@ -589,12 +662,12 @@ def _render_list_table(postings: list[JobPosting]) -> None:
         score = "-" if posting.score is None else str(posting.score)
         table.add_row(
             posting.id[:8],
-            f"[{_score_style(posting.score)}]{score}[/{_score_style(posting.score)}]",
-            posting.title,
-            posting.company,
-            posting.source,
+            _plain(score, _score_style(posting.score)),
+            _plain(posting.title),
+            _plain(posting.company),
+            _plain(posting.source),
             posting.work_mode.value,
-            posting.location or "[dim]-[/dim]",
+            _plain(posting.location) if posting.location else _plain("-", "dim"),
             posting.status.value,
         )
     _out.print(table)
@@ -605,25 +678,25 @@ def _render_detail(posting: JobPosting) -> None:
     grid.add_column(style="dim", justify="right")
     grid.add_column()
 
-    def row(label: str, value: str) -> None:
+    def row(label: str, value: str | Text) -> None:
         grid.add_row(label, value)
 
     row("id", posting.id)
-    row("title", f"[bold]{posting.title}[/bold]")
-    row("company", posting.company)
-    row("source", posting.source)
-    row("url", posting.url)
+    row("title", _plain(posting.title, "bold"))
+    row("company", _plain(posting.company))
+    row("source", _plain(posting.source))
+    row("url", _plain(posting.url))
     if posting.raw_url != posting.url:
-        row("raw url", posting.raw_url)
-    row("location", posting.location or "-")
+        row("raw url", _plain(posting.raw_url))
+    row("location", _plain(posting.location or "-"))
     row("work mode", posting.work_mode.value)
     if posting.contract_type:
-        row("contract", posting.contract_type)
+        row("contract", _plain(posting.contract_type))
     if posting.salary_text:
-        row("salary", posting.salary_text)
+        row("salary", _plain(posting.salary_text))
     if posting.eligible_locations:
-        row("eligible", ", ".join(posting.eligible_locations))
-    row("language", posting.detected_language or "undetermined")
+        row("eligible", _plain(", ".join(posting.eligible_locations)))
+    row("language", _plain(posting.detected_language or "undetermined"))
     if posting.published_at:
         row("published", f"{posting.published_at:%Y-%m-%d}")
     row("fetched", f"{posting.fetched_at:%Y-%m-%d}")
@@ -631,9 +704,9 @@ def _render_detail(posting: JobPosting) -> None:
     row("status", f"{posting.status.value}{applied}")
 
     score = "not scored yet" if posting.score is None else str(posting.score)
-    row("score", f"[{_score_style(posting.score)}]{score}[/{_score_style(posting.score)}]")
+    row("score", _plain(score, _score_style(posting.score)))
     if posting.summary:
-        row("summary", posting.summary)
+        row("summary", _plain(posting.summary))
     _detail_skill_row(grid, "matched", posting.matched_skills)
     _detail_skill_row(grid, "not mentioned", posting.unmatched_profile_skills)
     _detail_skill_row(grid, "missing reqs", posting.missing_requirements)
@@ -642,24 +715,25 @@ def _render_detail(posting: JobPosting) -> None:
     _out.print(grid)
     if posting.description_clean or posting.description_raw:
         _out.rule("description")
-        _out.print(posting.description_clean or posting.description_raw)
+        _out.print(_plain(posting.description_clean or posting.description_raw))
 
 
 def _detail_skill_row(grid: Table, label: str, skills: list[str]) -> None:
     if skills:
-        grid.add_row(label, ", ".join(skills))
+        grid.add_row(label, _plain(", ".join(skills)))
 
 
 def _render_export(outcomes: list[ExportOutcome], *, dry_run: bool) -> None:
     for outcome in outcomes:
+        _print_unreadable(outcome.unreadable, what=f"the {outcome.fmt} export")
         if outcome.error is not None:
-            _err.print(f"[red]{outcome.fmt}:[/red] {outcome.error}")
+            _err.print(Text.assemble((f"{outcome.fmt}:", "red"), " ", outcome.error))
         elif dry_run:
             _out.print(
                 f"[cyan]{outcome.fmt}[/cyan]: would export {outcome.would_export} posting(s)."
             )
         elif outcome.result is not None:
-            _out.print(f"[green]{outcome.fmt}[/green]: {outcome.result.detail}")
+            _out.print(Text.assemble((outcome.fmt, "green"), ": ", outcome.result.detail))
 
 
 # --------------------------------------------------------------------------
@@ -706,14 +780,29 @@ def _posting_summary(posting: JobPosting) -> dict[str, Any]:
     }
 
 
+# Reads as a continuation of the sentence naming the reference, so it must
+# not carry its own subject.
+_UNREADABLE_HINT = (
+    "is stored but could not be read; the reason is in the log above, and the "
+    "README's Limitations cover what can be done about it"
+)
+
+
 def _resolve_ref(storage: SqliteStorage, ref: str) -> JobPosting:
-    """Resolve a CLI ``<ref>`` (id prefix or URL) to exactly one posting."""
+    """Resolve a CLI ``<ref>`` (id prefix or URL) to exactly one posting.
+
+    A row storage had to skip looks exactly like a row that is not there.
+    Reporting it as absent would be false, and would hide the same broken
+    row the skip was meant to survive — so the two cases are told apart.
+    """
     if "://" in ref:
         try:
             posting = storage.get_by_url(ref)
         except ValueError as exc:
             raise click.ClickException(f"{ref!r} is not a usable URL: {exc}") from exc
         if posting is None:
+            if storage.unreadable_rows:
+                raise click.ClickException(f"The posting at {ref!r} {_UNREADABLE_HINT}.")
             raise click.ClickException(f"No posting has the URL {ref!r}.")
         return posting
 
@@ -725,6 +814,10 @@ def _resolve_ref(storage: SqliteStorage, ref: str) -> JobPosting:
     if len(matches) == 1:
         return matches[0]
     if not matches:
+        if storage.unreadable_rows:
+            raise click.ClickException(
+                f"The only posting matching the id prefix {ref!r} {_UNREADABLE_HINT}."
+            )
         raise click.ClickException(f"No posting matches the id prefix {ref!r}.")
     listed = "\n".join(f"  {p.id[:8]}  {p.title} ({p.company})" for p in matches)
     raise click.ClickException(f"The id prefix {ref!r} matches several postings:\n{listed}")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Sequence
 from datetime import datetime
@@ -17,6 +18,8 @@ from jobsearcher.models import (
     normalize_job_url,
     posting_id,
 )
+
+logger = logging.getLogger(__name__)
 
 _COLUMNS: tuple[str, ...] = (
     "url",
@@ -134,20 +137,47 @@ def _schema_version(connection: sqlite3.Connection) -> int:
 
 
 def _migrate(connection: sqlite3.Connection) -> None:
-    """Bring the database schema up to `CURRENT_SCHEMA_VERSION` in place."""
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
-    current = _schema_version(connection)
-    for version in sorted(v for v in _MIGRATIONS if v > current):
-        for statement in _MIGRATIONS[version]:
-            connection.execute(statement)
+    """Bring the database schema up to `CURRENT_SCHEMA_VERSION` in place.
+
+    Each version's statements and its `schema_version` bump run inside one
+    explicit transaction, so a batch either lands whole or not at all. That
+    is not the default: sqlite3 only opens an implicit transaction for DML,
+    which would let every `ALTER TABLE` auto-commit on its own while the
+    recorded version stayed behind. A batch interrupted halfway would then
+    be replayed on the next open against a schema that had already moved
+    ("no such column: missing_skills"), and keep failing forever with no way
+    to open the database and repair it.
+
+    Raises:
+        sqlite3.Error: If a migration fails. The database is left on the
+            last version that applied completely.
+    """
+    previous_isolation = connection.isolation_level
+    # Take explicit control of transactions: with the default isolation
+    # level, sqlite3 decides on its own when to BEGIN, and never does so for
+    # the DDL that migrations are made of.
+    connection.isolation_level = None
+    try:
         connection.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(version),),
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
-    connection.commit()
+        current = _schema_version(connection)
+        for version in sorted(v for v in _MIGRATIONS if v > current):
+            connection.execute("BEGIN")
+            try:
+                for statement in _MIGRATIONS[version]:
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(version),),
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            connection.commit()
+    finally:
+        connection.isolation_level = previous_isolation
 
 
 def _bool_to_db(value: bool | None) -> int | None:
@@ -234,8 +264,54 @@ def _to_row(posting: JobPosting) -> tuple[Any, ...]:
     )
 
 
+def _read_row(row: sqlite3.Row) -> JobPosting | None:
+    """Decode one `postings` row, or return `None` if it cannot be decoded.
+
+    A stored row can stop being readable for reasons no command can fix from
+    the outside: an enum value written by a newer version, a URL an older
+    one stored relative, a hand-edited database. Letting that raise would
+    take down `list` — the command the tool is used through — over a single
+    row, and leave no way to reach the others.
+
+    The row is therefore skipped and logged at WARNING with its identifier
+    and URL, which is the only place it can be identified from afterwards.
+    Skipping is *not* the same as hiding: every read counts what it left out
+    (see :attr:`SqliteStorage.unreadable_rows`) so the caller can say so.
+
+    Args:
+        row: One row from the `postings` table.
+
+    Returns:
+        The posting, or `None` if the row could not be decoded.
+    """
+    try:
+        return _from_row(row)
+    except (ValueError, TypeError) as exc:
+        # Covers every decoder used below: the enums and datetime parsing
+        # raise ValueError, json raises JSONDecodeError (a ValueError),
+        # pydantic raises ValidationError (also a ValueError), and a NULL
+        # where a string belongs raises TypeError.
+        # Logged at WARNING, which the CLI shows without -v: this is the
+        # only record of which row went missing. Kept to one line per row —
+        # a badly damaged database would otherwise bury its own summary.
+        logger.warning(
+            "Skipping unreadable stored posting %s (%r): %s",
+            row["id"] or "<no id>",
+            row["url"],
+            exc,
+        )
+        return None
+
+
 def _from_row(row: sqlite3.Row) -> JobPosting:
-    """Convert a `postings` row back into a `JobPosting`."""
+    """Convert a `postings` row back into a `JobPosting`.
+
+    Raises:
+        ValueError: If a stored value no longer satisfies the model (an
+            unknown enum member, an unparsable datetime, malformed JSON, a
+            URL that is not absolute).
+        TypeError: If a column holds NULL where a value is required.
+    """
     return JobPosting(
         url=row["url"],
         raw_url=row["raw_url"],
@@ -282,10 +358,17 @@ class SqliteStorage:
             database: Path to the SQLite database file, or ``":memory:"``.
             timeout: Seconds to wait for the database lock before failing.
         """
+        self._unreadable_rows = 0
         self._connection = sqlite3.connect(str(database), timeout=timeout)
-        self._connection.row_factory = sqlite3.Row
-        _migrate(self._connection)
-        self._backfill_posting_ids()
+        try:
+            self._connection.row_factory = sqlite3.Row
+            _migrate(self._connection)
+            self._backfill_posting_ids()
+        except BaseException:
+            # Never leave a half-opened store behind: the caller gets the
+            # error instead of a handle, so nothing would close this.
+            self._connection.close()
+            raise
 
     def _backfill_posting_ids(self) -> None:
         """Fill the `id` column for rows that predate schema version 4.
@@ -294,15 +377,60 @@ class SqliteStorage:
         migration's SQL. This runs once per legacy row (``WHERE id IS
         NULL``) and no-ops thereafter, so opening an already-migrated
         database costs a single cheap query.
+
+        A row whose stored URL cannot be normalized (a relative one written
+        by some earlier version, say) is logged and skipped rather than
+        allowed to raise: one unusable row must not stand between the user
+        and every command, including the ones they would need to inspect or
+        repair it. Its `id` stays NULL, which the UNIQUE index tolerates.
         """
         rows = self._connection.execute("SELECT url FROM postings WHERE id IS NULL").fetchall()
         if not rows:
             return
+
+        updates: list[tuple[str, str]] = []
+        for row in rows:
+            try:
+                updates.append((posting_id(row["url"]), row["url"]))
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping the id backfill for stored posting %r: %s. "
+                    "The row is kept, but commands that resolve postings by id "
+                    "will not find it.",
+                    row["url"],
+                    exc,
+                )
+        if not updates:
+            return
         with self._connection:
             self._connection.executemany(
                 "UPDATE postings SET id = ? WHERE url = ?",
-                [(posting_id(row["url"]), row["url"]) for row in rows],
+                updates,
             )
+
+    @property
+    def unreadable_rows(self) -> int:
+        """How many stored rows the most recent read had to skip.
+
+        Reset at the start of every read (`list`, `get_by_url`,
+        `find_by_id_prefix`), so it always describes the last one rather
+        than the lifetime of this handle. A caller that shows results to a
+        user must surface a non-zero value: a row quietly missing from a
+        list is precisely the failure this layer exists to avoid.
+        """
+        return self._unreadable_rows
+
+    def _decode(self, rows: Sequence[sqlite3.Row]) -> list[JobPosting]:
+        """Decode a result set, counting and skipping what cannot be read."""
+        self._unreadable_rows = 0
+        postings: list[JobPosting] = []
+        for row in rows:
+            posting = _read_row(row)
+            if posting is None:
+                self._unreadable_rows += 1
+            else:
+                postings.append(posting)
+        return postings
 
     def __enter__(self) -> SqliteStorage:
         return self
@@ -352,7 +480,8 @@ class SqliteStorage:
         row = self._connection.execute(
             "SELECT * FROM postings WHERE url = ?", (normalize_job_url(url),)
         ).fetchone()
-        return _from_row(row) if row is not None else None
+        found = self._decode([row] if row is not None else [])
+        return found[0] if found else None
 
     def find_by_id_prefix(self, prefix: str) -> list[JobPosting]:
         """Return every posting whose identifier starts with ``prefix``.
@@ -371,7 +500,7 @@ class SqliteStorage:
             "SELECT * FROM postings WHERE id LIKE ? ESCAPE '\\' ORDER BY fetched_at DESC",
             (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
         ).fetchall()
-        return [_from_row(row) for row in rows]
+        return self._decode(rows)
 
     def list(
         self,
@@ -401,9 +530,15 @@ class SqliteStorage:
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
+        elif offset:
+            # SQLite has no bare OFFSET: a negative LIMIT means "no limit",
+            # which is how an offset-only page is expressed. Skipping this
+            # branch would drop the caller's offset without a word.
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(offset)
 
         rows = self._connection.execute(sql, params).fetchall()
-        return [_from_row(row) for row in rows]
+        return self._decode(rows)
 
     def update_score(
         self,

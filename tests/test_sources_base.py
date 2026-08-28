@@ -11,9 +11,12 @@ from typing import Any
 import httpx
 import pytest
 
+from jobsearcher import __version__
 from jobsearcher.config import PluginConfig
 from jobsearcher.models import JobPosting
 from jobsearcher.sources.base import (
+    PROJECT_URL,
+    USER_AGENT,
     Source,
     SourceConfigError,
     SourceError,
@@ -69,7 +72,8 @@ def test_fetch_yields_good_items_and_skips_malformed_ones() -> None:
     postings = list(source.fetch())
 
     assert len(postings) == 2
-    assert source.last_run == SourceRunStats(yielded=2, skipped=1, failed=False, errors=[])
+    assert source.last_run == SourceRunStats(yielded=2, skipped=1, errors=[])
+    assert source.last_run.failed is False
 
 
 def test_fetch_isolates_a_source_level_failure() -> None:
@@ -123,7 +127,8 @@ def test_fetch_resets_last_run_on_each_call() -> None:
 
     source._items = [{"url": "https://example.test/jobs/1"}]
     list(source.fetch())
-    assert source.last_run == SourceRunStats(yielded=1, skipped=0, failed=False, errors=[])
+    assert source.last_run == SourceRunStats(yielded=1, skipped=0, errors=[])
+    assert source.last_run.failed is False
 
 
 def test_register_source_and_lookup() -> None:
@@ -256,3 +261,76 @@ def test_context_manager_closes_owned_client() -> None:
     with _DummySource([]) as source:
         client = source._client
     assert client.is_closed
+
+
+# --------------------------------------------------------------------------
+# `failed` means "produced nothing usable", at every point it can be read
+# --------------------------------------------------------------------------
+
+
+def test_a_source_that_produced_then_broke_is_not_marked_failed() -> None:
+    """A board that dies after 3 postings still delivered 3 postings.
+
+    `failed` is documented as "produced nothing usable" precisely so that
+    "found nothing today", "one unit is broken" and "everything is broken"
+    stay tellable apart. Collapsing a mid-stream failure into `failed` makes
+    the caller discard a run that succeeded.
+    """
+    source = _DummySource(
+        [{"url": "https://example.com/1"}, {"url": "https://example.com/2"}],
+        fail_with=SourceUnavailableError("board went down"),
+    )
+
+    postings = list(source.fetch())
+
+    assert len(postings) == 2
+    assert source.last_run.yielded == 2
+    assert source.last_run.failed is False
+    assert source.last_run.errors == ["board went down"]
+
+
+def test_a_source_that_broke_before_producing_anything_is_failed() -> None:
+    source = _DummySource([], fail_with=SourceUnavailableError("board went down"))
+
+    postings = list(source.fetch())
+
+    assert postings == []
+    assert source.last_run.failed is True
+    assert source.last_run.errors == ["board went down"]
+
+
+def test_failed_is_correct_even_when_the_caller_stops_early() -> None:
+    """`--limit` abandons the generator; the flag must still read true.
+
+    Deriving `failed` from the counters rather than setting it in a trailing
+    statement is what makes a partially consumed run report honestly.
+    """
+    source = _DummySource(
+        [{"url": f"https://example.com/{index}"} for index in range(5)],
+        fail_with=SourceUnavailableError("never reached"),
+    )
+
+    fetched = source.fetch()
+    first = next(fetched)
+    fetched.close()
+
+    assert first.url == "https://example.com/0"
+    assert source.last_run.yielded == 1
+    assert source.last_run.failed is False
+
+
+def test_run_stats_failed_is_derived_from_the_counters() -> None:
+    assert SourceRunStats().failed is False
+    assert SourceRunStats(yielded=0, errors=["boom"]).failed is True
+    assert SourceRunStats(yielded=3, errors=["boom"]).failed is False
+    assert SourceRunStats(yielded=0, skipped=4).failed is False
+
+
+def test_user_agent_carries_the_real_version_and_a_project_url() -> None:
+    """Sent to every third-party site; a stale version or a dead URL is worse
+    than no User-Agent at all."""
+    assert f"JobSearcher/{__version__} (+{PROJECT_URL})" == USER_AGENT
+    assert PROJECT_URL.startswith("https://")
+    # The version is interpolated, not spelled out, so it cannot drift.
+    assert __version__ in USER_AGENT
+    assert "nathanaellewong" not in USER_AGENT
