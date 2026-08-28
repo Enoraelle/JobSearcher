@@ -1,10 +1,18 @@
 """Tests for jobsearcher.config."""
 
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
+import yaml
 
-from jobsearcher.config import ConfigError, load_config
+from jobsearcher.config import (
+    EXAMPLE_CONFIG_RESOURCE,
+    AppConfig,
+    ConfigError,
+    example_config_text,
+    load_config,
+)
 
 VALID_CONFIG = """
 profile:
@@ -58,31 +66,15 @@ def test_exporters_and_sources_share_the_same_shape(tmp_path: Path) -> None:
     assert type(config.sources["linkedin"]) is type(config.exporters["notion"])
 
 
-def test_load_config_prefers_config_yaml_over_example(
+def test_load_config_reads_config_yaml_from_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.yaml").write_text(VALID_CONFIG, encoding="utf-8")
-    (tmp_path / "config.example.yaml").write_text(
-        VALID_CONFIG.replace("python developer", "should not be used"), encoding="utf-8"
-    )
 
     config = load_config()
 
     assert config.sources["linkedin"].enabled is True
-
-
-def test_load_config_falls_back_to_example(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "config.example.yaml").write_text(VALID_CONFIG, encoding="utf-8")
-
-    with caplog.at_level("WARNING"):
-        config = load_config()
-
-    assert config.profile.role == "Python/Django Backend Developer"
-    assert "config.example.yaml" in caplog.text
 
 
 def test_load_config_raises_when_nothing_found(
@@ -92,6 +84,35 @@ def test_load_config_raises_when_nothing_found(
 
     with pytest.raises(ConfigError, match="No configuration file found"):
         load_config()
+
+
+def test_load_config_does_not_fall_back_to_a_cwd_example_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stray config.example.yaml in the working directory is never loaded."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.example.yaml").write_text(VALID_CONFIG, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="No configuration file found"):
+        load_config()
+
+
+def test_bundled_example_config_ships_in_the_package() -> None:
+    """The example config must be importable as package data (guards packaging).
+
+    Without this, a future change to the wheel build could drop the file and
+    break `jobsearcher init` from a `pip install` without any test noticing.
+    """
+    resource = files("jobsearcher") / EXAMPLE_CONFIG_RESOURCE
+    assert resource.is_file()
+
+    text = example_config_text()
+    assert text.strip()
+    assert text == resource.read_text(encoding="utf-8")
+
+
+def test_bundled_example_config_is_a_valid_configuration() -> None:
+    AppConfig.model_validate(yaml.safe_load(example_config_text()))
 
 
 def test_load_config_invalid_yaml_raises_readable_error(tmp_path: Path) -> None:

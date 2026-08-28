@@ -1,29 +1,37 @@
 # Example JobSearcher configuration.
 #
-# Copy this file to config.yaml and fill in your own profile — config.yaml is
-# gitignored because it holds personal data, config.example.yaml is the only
-# version tracked in the repository.
+# This file ships inside the installed package. Run `jobsearcher init` to
+# copy it to config.yaml in the current directory, then adjust it to your
+# own profile. config.yaml is gitignored because it holds personal data.
+#
+# As shipped, this file runs end to end with no API key and no editing:
+# `jobsearcher run` collects from We Work Remotely's public feed, scores
+# every posting offline against the profile below, and writes digest.md.
+# Edit the profile so the scores mean something for you, then enable more
+# sources.
 
 search:
-  title_keywords_include:
-    - "python developer"
-    - "backend engineer"
-    - "django"
+  # Title filters applied while collecting (case-insensitive substring).
+  # An excluded term anywhere in the title drops the posting. If any
+  # include terms are set, at least one must appear; with none set, every
+  # non-excluded title passes.
+  title_keywords_include: []
   title_keywords_exclude:
-    - "senior"
-    - "staff"
-    - "lead"
-  # NOT a collection filter. Nothing is dropped while fetching: every posting
-  # is tagged with a best-effort detected language (fr/en/de/es, or blank when
-  # undetermined) and this list is only the default filter `jobsearcher list`
-  # applies at display time. Override it per run with `--language <code>` or
-  # see everything with `--language all`; postings whose language could not be
-  # determined are never hidden.
+    - senior
+    - staff
+    - principal
+
+  # NOT a collection filter. Nothing is dropped while fetching: every
+  # posting is tagged with a best-effort detected language (fr/en/de/es, or
+  # blank when undetermined) and this list is only the default filter
+  # `jobsearcher list` applies at display time. Override it per run with
+  # `--language <code>` or see everything with `--language all`; postings
+  # whose language could not be determined are never hidden.
   languages:
     - en
-    - fr
 
 profile:
+  # `role` is the only required field in this file.
   role: "Python/Django Backend Developer"
   skills:
     - python
@@ -43,21 +51,9 @@ profile:
     - Remote - EU
 
 sources:
-  linkedin:
-    enabled: true
-    query: "python django developer"
-  indeed:
-    enabled: false
-
-  # JSON API source (see sources/greenhouse.py). One request per configured
-  # company slug against Greenhouse's public, unauthenticated Job Board API.
-  greenhouse:
-    enabled: true
-    companies:
-      - some-company
-
-  # RSS feed source (see sources/weworkremotely.py). "remote-jobs" is the
-  # site-wide feed; any other entry is treated as a We Work Remotely
+  # RSS feed source (see sources/weworkremotely.py). Enabled by default and
+  # needs no configuration: with no `feeds` set it reads the site-wide
+  # "remote-jobs" feed. Any other entry is treated as a We Work Remotely
   # category slug and fetched from its own feed
   # (https://weworkremotely.com/categories/<slug>.rss).
   weworkremotely:
@@ -67,19 +63,28 @@ sources:
       - remote-programming-jobs
     # Off by default: fetching every posting's own page (one extra request
     # per posting, on top of the feed requests) to get its full description
-    # instead of the RSS feed's truncated one. Turn on only with a
-    # deliberately conservative min_request_interval configured for this
-    # source, since it turns O(feeds) requests into O(postings) requests.
+    # instead of the RSS feed's truncated one.
     fetch_full_description: false
     max_postings_per_feed: 50
+
+  # JSON API source (see sources/greenhouse.py). One request per configured
+  # company slug against Greenhouse's public, unauthenticated Job Board API.
+  # Disabled until you list the companies you care about: the slug is the
+  # last path segment of a company's Greenhouse board URL
+  # (boards.greenhouse.io/<slug>).
+  greenhouse:
+    enabled: false
+    companies:
+      - example-company
 
   # HTML-scraping source (see sources/freework.py). One search request per
   # configured keyword against free-work.com's tech/IT job search. This is
   # the fragile shape: free-work.com publishes no API contract, so a site
   # redesign can break the selectors this source depends on — see that
-  # module's docstring for how such a failure is surfaced.
+  # module's docstring for how such a failure is surfaced. Disabled by
+  # default.
   freework:
-    enabled: true
+    enabled: false
     keywords:
       - "python django"
       - "développeur backend"
@@ -107,9 +112,9 @@ scoring:
   absent_skill_penalty: 0.34
   absent_skill_penalty_cap: 1.0
 
-  # Bonus, opt-in, requires `pip install jobsearcher[llm]` and an API key in
-  # the environment (never in this file). Talks to any OpenAI-compatible
-  # endpoint. Uncomment to use it instead of keyword_match.
+  # Bonus, opt-in, requires `pip install "jobsearcher[llm]"` and an API key
+  # in the environment (never in this file). Talks to any OpenAI-compatible
+  # endpoint. Replace the block above with this one to use it.
   # backend: llm
   # base_url: "https://api.openai.com/v1"
   # model: "gpt-4o-mini"
@@ -117,10 +122,11 @@ scoring:
   # max_postings_per_run: 25
 
 exporters:
-  # Offline file formats, standard library only. Each needs an `output_path`.
-  # Postings are written sorted by score, highest first. The Markdown file is
-  # meant to be read by a person: one bullet per posting with a link, and the
-  # posting's geographic eligibility restrictions shown when it has any.
+  # Offline file formats, standard library only. Each needs an
+  # `output_path`. Postings are written sorted by score, highest first. The
+  # Markdown file is meant to be read by a person: one bullet per posting
+  # with a link, and the posting's geographic eligibility restrictions
+  # shown when it has any.
   markdown:
     enabled: true
     output_path: "./digest.md"
@@ -131,7 +137,7 @@ exporters:
     enabled: false
     output_path: "./jobs.json"
 
-  # Bonus, opt-in, requires `pip install jobsearcher[notion]`. Keeps one
+  # Bonus, opt-in, requires `pip install "jobsearcher[notion]"`. Keeps one
   # database page per posting, matched by URL so re-exporting updates rather
   # than duplicates; the application status goes to a select property. The
   # integration token is read only from the environment variable named by
@@ -143,8 +149,8 @@ exporters:
     database_id: "your-notion-database-id"
     api_key_env: "NOTION_API_KEY"
     # Property names, if yours differ from these defaults:
-    # title_property: "Name"        # (title)
-    # url_property: "URL"           # (url)   — the idempotency key
+    # title_property: "Name"       # (title)
+    # url_property: "URL"          # (url)   — the idempotency key
     # status_property: "Status"    # (select)
     # company_property: "Company"  # (rich text)
     # score_property: "Score"      # (number)

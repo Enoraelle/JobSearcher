@@ -8,6 +8,7 @@ the public names below re-exported unchanged from config/__init__.py.
 
 from __future__ import annotations
 
+import importlib.resources
 import logging
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,24 @@ from jobsearcher.models import WorkMode
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
-EXAMPLE_CONFIG_PATH = Path("config.example.yaml")
+
+# The example configuration ships as data inside the package (see the
+# ``[tool.hatch.build.targets.wheel.force-include]`` entry in pyproject.toml),
+# so ``jobsearcher init`` works from a plain ``pip install`` just as well as
+# from a checkout. This is the resource name within the ``jobsearcher``
+# package, not a filesystem path.
+EXAMPLE_CONFIG_RESOURCE = "config.example.yaml"
+
+
+def example_config_text() -> str:
+    """Return the contents of the example configuration bundled in the package.
+
+    Returns:
+        The full text of ``config.example.yaml`` as shipped inside the
+        installed ``jobsearcher`` package.
+    """
+    resource = importlib.resources.files("jobsearcher") / EXAMPLE_CONFIG_RESOURCE
+    return resource.read_text(encoding="utf-8")
 
 
 class ConfigError(Exception):
@@ -82,8 +100,10 @@ class AppConfig(BaseModel):
 def load_config(path: Path | None = None) -> AppConfig:
     """Load and validate JobSearcher configuration.
 
-    Resolution order: ``config.yaml`` if it exists, otherwise
-    ``config.example.yaml`` (with a warning logged).
+    Resolution: the explicit ``path`` if given, otherwise ``config.yaml`` in
+    the current directory. There is no implicit fallback to the bundled
+    example — run ``jobsearcher init`` to materialize it as ``config.yaml``
+    first.
 
     Args:
         path: Optional explicit path to a config file, bypassing resolution.
@@ -95,30 +115,19 @@ def load_config(path: Path | None = None) -> AppConfig:
         ConfigError: If no config file can be found, the YAML is malformed,
             or the content fails schema validation.
     """
-    resolved_path = path or _resolve_config_path()
+    resolved_path = path or DEFAULT_CONFIG_PATH
+    if not resolved_path.exists():
+        raise ConfigError(
+            f"No configuration file found at '{resolved_path}'. Run `jobsearcher init` "
+            f"to create '{DEFAULT_CONFIG_PATH}' from the bundled example, or pass "
+            f"--config PATH."
+        )
     raw = _read_yaml(resolved_path)
 
     try:
         return AppConfig.model_validate(raw)
     except ValidationError as exc:
-        raise ConfigError(_format_validation_error(resolved_path, exc)) from exc
-
-
-def _resolve_config_path() -> Path:
-    if DEFAULT_CONFIG_PATH.exists():
-        return DEFAULT_CONFIG_PATH
-    if EXAMPLE_CONFIG_PATH.exists():
-        logger.warning(
-            "%s not found; falling back to %s. Copy it to %s and fill in your own profile.",
-            DEFAULT_CONFIG_PATH,
-            EXAMPLE_CONFIG_PATH,
-            DEFAULT_CONFIG_PATH,
-        )
-        return EXAMPLE_CONFIG_PATH
-    raise ConfigError(
-        f"No configuration file found. Expected '{DEFAULT_CONFIG_PATH}' or "
-        f"'{EXAMPLE_CONFIG_PATH}' in the current directory."
-    )
+        raise ConfigError(_format_validation_error(str(resolved_path), exc)) from exc
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -126,20 +135,23 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         content = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"Could not read configuration file '{path}': {exc}") from exc
+    return _parse_yaml(content, str(path))
 
+
+def _parse_yaml(content: str, label: str) -> dict[str, Any]:
     try:
         data = yaml.safe_load(content)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"Configuration file '{path}' is not valid YAML: {exc}") from exc
+        raise ConfigError(f"Configuration file '{label}' is not valid YAML: {exc}") from exc
 
     if not isinstance(data, dict):
         raise ConfigError(
-            f"Configuration file '{path}' must contain a YAML mapping at the top level."
+            f"Configuration file '{label}' must contain a YAML mapping at the top level."
         )
     return data
 
 
-def _format_validation_error(path: Path, exc: ValidationError) -> str:
+def _format_validation_error(path: str, exc: ValidationError) -> str:
     lines = [f"Invalid configuration in '{path}':"]
     for error in exc.errors():
         location = ".".join(str(part) for part in error["loc"]) or "<root>"

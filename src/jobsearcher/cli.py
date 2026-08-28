@@ -20,7 +20,6 @@ import contextlib
 import json
 import logging
 import re
-import shutil
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -44,9 +43,9 @@ from rich.table import Table
 from jobsearcher import __version__
 from jobsearcher.config import (
     DEFAULT_CONFIG_PATH,
-    EXAMPLE_CONFIG_PATH,
     AppConfig,
     ConfigError,
+    example_config_text,
     load_config,
 )
 from jobsearcher.exporters import EXPORTER_FORMATS
@@ -151,7 +150,7 @@ pass_app = click.make_pass_decorator(AppContext)
     "config_path",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help=f"Config file to load (default: {DEFAULT_CONFIG_PATH}, then {EXAMPLE_CONFIG_PATH}).",
+    help=f"Config file to load (default: {DEFAULT_CONFIG_PATH}).",
 )
 @click.option("-v", "--verbose", count=True, help="Log more (-v info, -vv debug).")
 @click.option(
@@ -181,12 +180,8 @@ def init(force: bool) -> None:
         raise click.ClickException(
             f"{DEFAULT_CONFIG_PATH} already exists. Edit it, or pass --force to overwrite it."
         )
-    if not EXAMPLE_CONFIG_PATH.exists():
-        raise click.ClickException(
-            f"{EXAMPLE_CONFIG_PATH} is missing; cannot create {DEFAULT_CONFIG_PATH} from it."
-        )
-    shutil.copyfile(EXAMPLE_CONFIG_PATH, DEFAULT_CONFIG_PATH)
-    _out.print(f"[green]Created[/green] {DEFAULT_CONFIG_PATH} from {EXAMPLE_CONFIG_PATH}.")
+    DEFAULT_CONFIG_PATH.write_text(example_config_text(), encoding="utf-8")
+    _out.print(f"[green]Created[/green] {DEFAULT_CONFIG_PATH} from the bundled example.")
     _out.print(
         "\nNext:\n"
         f"  1. Edit [cyan]{DEFAULT_CONFIG_PATH}[/cyan] - set your [cyan]profile:[/cyan] "

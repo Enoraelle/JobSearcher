@@ -86,20 +86,18 @@ def _invoke(runner: CliRunner, *args: str) -> Any:
 # --------------------------------------------------------------------------
 
 
-def test_init_creates_config_from_example(runner: CliRunner) -> None:
-    with open("config.example.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(_config_dict(), handle)
-
+def test_init_creates_config_from_the_bundled_example(runner: CliRunner) -> None:
+    """`init` works with nothing in the working directory but the package."""
     result = _invoke(runner, "init")
 
     assert result.exit_code == 0
-    with open("config.yaml", encoding="utf-8") as handle:
-        assert "profile" in handle.read()
+    assert Path("config.yaml").is_file()
+    # The bundled example must survive the round trip as a loadable config.
+    listed = _invoke(runner, "list")
+    assert listed.exit_code == 0
 
 
 def test_init_refuses_to_overwrite_without_force(runner: CliRunner) -> None:
-    with open("config.example.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(_config_dict(), handle)
     _invoke(runner, "init")
 
     result = _invoke(runner, "init")

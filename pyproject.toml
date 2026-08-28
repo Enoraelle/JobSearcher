@@ -46,6 +46,12 @@ path = "src/jobsearcher/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/jobsearcher"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# Ship the example config as package data so `jobsearcher init` works from a
+# plain `pip install`, not only from a source checkout. Loaded via
+# importlib.resources; see jobsearcher.config.example_config_text.
+"src/jobsearcher/config.example.yaml" = "jobsearcher/config.example.yaml"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
