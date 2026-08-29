@@ -428,6 +428,21 @@ score is never silently clobbered by a rescrape.
   fails with a message that says the layout has probably changed (rather
   than a stack trace), and `fetch_full_description` quietly falls back to
   the truncated RSS description. Expect to update selectors periodically.
+- **`freework` reads only the first page of results per keyword.** It sends
+  one search request per entry in `keywords:` and does not follow
+  free-work.com's pagination, so anything that does not fit on the first
+  results page is never collected. `max_postings_per_keyword` only lowers
+  that ceiling — it cannot see past the first page, and setting it higher
+  than a page holds has no effect. Collect more by adding narrower
+  keywords, not by raising the limit.
+- **RSS feeds are parsed with the standard library's XML parser.**
+  `xml.etree.ElementTree` does not resolve external entities, so a feed
+  cannot make JobSearcher fetch a URL or read a local file. It offers no
+  protection against entity expansion, though ("billion laughs" and
+  quadratic blowup): a compromised or intercepted feed could exhaust memory
+  during parsing. What keeps this theoretical is that the only feeds parsed
+  are the ones We Work Remotely serves over HTTPS — the parser itself adds
+  no hardening.
 - **The keyword scorer is lexical, not semantic.** It matches names, not
   meaning: it will not infer that a posting asking for "DRF" wants Django
   unless you add that synonym. Terse postings produce low coverage without

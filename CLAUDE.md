@@ -82,6 +82,30 @@ imports.
   except score/status/summary/matched_skills/missing_skills, or a
   content-hash check to detect and apply only real changes.
 
+- **`normalize()` makes HTTP calls in the We Work Remotely source.** With
+  `fetch_full_description: true`,
+  `WeWorkRemotelySource.normalize`
+  ([weworkremotely.py](src/jobsearcher/sources/weworkremotely.py)) issues
+  one extra GET per posting to replace the truncated RSS description. That
+  contradicts the split `Source` is built on — `fetch_raw` owns all HTTP,
+  `normalize` converts one already-fetched item — and the surrounding
+  machinery assumes it: `fetch()` treats a `normalize` failure as a
+  malformed *item* (it catches only `KeyError`/`ValueError`/
+  `ValidationError` and counts `skipped`), and the per-unit error isolation
+  in `fetch_raw` never sees these requests, so a detail-page failure is
+  only logged — it reaches neither `skipped` nor `last_run.errors`, and a
+  posting silently degraded to its truncated description counts as a clean
+  success. Rate limiting is affected the same way: `min_request_interval`
+  is the source's single global spacing, sized in every other source for
+  one request per unit, which is why this source's docstring has to tell
+  callers to set it when they enable the option. Deliberate for v1 (the
+  fan-out is opt-in and degrades rather than fails), and no code change is
+  proposed here — but anyone reasoning about item counts, recorded errors,
+  or request pacing should know `normalize` is not side-effect-free.
+  Revisit alongside a decision on where a two-phase fetch (list, then
+  detail) belongs: most plausibly in `fetch_raw`, which already owns unit
+  boundaries and error recording.
+
 ## Absolute rules
 
 - **Never run `git push`, nor any command that rewrites history**

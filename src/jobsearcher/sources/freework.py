@@ -27,6 +27,15 @@ searches one keyword at a time and, if that keyword's request fails or its
 results page doesn't parse, records the failure with `Source._record_error`
 and moves on to the next keyword rather than aborting the rest of the list.
 
+Only the first page of results is collected for a keyword. `fetch_raw`
+issues exactly one request per keyword and never follows free-work.com's
+pagination, so everything past the first results page is simply not seen.
+`max_postings_per_keyword` is a cap *below* that ceiling, not a window onto
+a larger stream: it can reduce what a keyword contributes, but it can never
+raise it above one page, and a value larger than a page holds changes
+nothing. Widening coverage today means configuring more (or more specific)
+keywords; following pagination would be a change to this module.
+
 A results page with zero job cards is ambiguous on its own: it could mean
 "no postings currently match this keyword" (not a failure) or "the card
 selector is stale" (a failure). `_parse_search_results` disambiguates by
