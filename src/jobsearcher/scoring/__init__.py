@@ -2,8 +2,8 @@
 
 :class:`~jobsearcher.scoring.keyword.KeywordScorer` (offline, deterministic,
 zero configuration) is the default and is always importable.
-:class:`~jobsearcher.scoring.llm.LlmScorer` is a bonus behind the ``llm``
-extra and is imported on demand — :func:`get_scorer` is the only place that
+:class:`~jobsearcher.scoring.llm.LlmScorer` is a bonus that costs API
+calls, and is imported on demand — :func:`get_scorer` is the only place that
 reaches for it, and only when ``scoring.backend`` asks for it.
 """
 
@@ -40,8 +40,6 @@ def get_scorer(config: BackendSectionConfig) -> Scorer:
         ScoringConfigError: If ``backend`` is neither ``keyword_match`` nor
             ``llm``.
         ValueError: If the backend-specific configuration is invalid.
-        ModuleNotFoundError: If ``backend`` is ``llm`` but the ``llm`` extra
-            is not installed (the message says how to fix it).
     """
     if config.backend in _KEYWORD_BACKENDS:
         return KeywordScorer(config)

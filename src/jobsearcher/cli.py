@@ -58,7 +58,7 @@ from jobsearcher.config import (
     load_config,
 )
 from jobsearcher.exporters import EXPORTER_FORMATS
-from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode
+from jobsearcher.models import ApplicationStatus, JobPosting
 from jobsearcher.pipeline import (
     ExportOutcome,
     Pipeline,
@@ -72,6 +72,12 @@ from jobsearcher.storage.sqlite import SqliteStorage
 
 _STATUS_VALUES = tuple(status.value for status in ApplicationStatus)
 _SORT_VALUES = ("score", "date", "company")
+# `list`, `export` and `run` read the same postings, so they share the wording
+# of the filter that decides which ones.
+_LANGUAGE_HELP = (
+    "Detected-language filter (repeatable). 'all' shows every language. "
+    "Default: search.languages from config."
+)
 _ID_PREFIX_RE = re.compile(r"[0-9a-fA-F]{4,12}")
 
 _out = Console()
@@ -314,13 +320,7 @@ def score(ctx: AppContext, limit: int | None, rescore: bool) -> None:
 )
 @click.option("--remote", is_flag=True, help="Only fully-remote postings.")
 @click.option("--unscored", is_flag=True, help="Only postings with no score.")
-@click.option(
-    "--language",
-    "languages",
-    multiple=True,
-    help="Detected-language filter (repeatable). 'all' shows every language. "
-    "Default: search.languages from config.",
-)
+@click.option("--language", "languages", multiple=True, help=_LANGUAGE_HELP)
 @click.option("--limit", type=click.IntRange(min=0), default=50, help="Max rows (0 = all).")
 @click.option("--sort", type=click.Choice(_SORT_VALUES), default="score")
 @click.option("--json", "as_json", is_flag=True, help="Emit a JSON array instead of a table.")
@@ -339,25 +339,21 @@ def list_postings(
     as_json: bool,
 ) -> None:
     """Show stored postings as a table (or JSON)."""
-    if unscored and (min_score is not None or max_score is not None):
-        raise click.UsageError("--unscored cannot be combined with --min-score/--max-score.")
-
-    config = ctx.load_config()
-    resolved_languages = _resolve_languages(languages, config.search.languages)
+    filters = _posting_filters(
+        ctx,
+        source=source,
+        status=status,
+        min_score=min_score,
+        max_score=max_score,
+        remote=remote,
+        unscored=unscored,
+        languages=languages,
+    )
 
     with ctx.open_storage() as storage:
-        postings = storage.list(
-            source=source,
-            status=ApplicationStatus(status) if status else None,
-            min_score=min_score,
-            max_score=max_score,
-            scored=False if unscored else None,
-            languages=resolved_languages,
-        )
+        postings = filters.select(storage)
         _report_unreadable(storage)
 
-    if remote:
-        postings = [p for p in postings if p.work_mode is WorkMode.REMOTE]
     postings = _sorted_postings(postings, sort)
     if limit:
         postings = postings[:limit]
@@ -437,6 +433,8 @@ def set_status(
 @click.option("--source", default=None)
 @click.option("--status", type=click.Choice(_STATUS_VALUES), default=None)
 @click.option("--remote", is_flag=True)
+@click.option("--unscored", is_flag=True, help="Only postings with no score.")
+@click.option("--language", "languages", multiple=True, help=_LANGUAGE_HELP)
 @pass_app
 def export(
     ctx: AppContext,
@@ -447,17 +445,27 @@ def export(
     source: str | None,
     status: str | None,
     remote: bool,
+    unscored: bool,
+    languages: tuple[str, ...],
 ) -> None:
-    """Write stored postings to a file format or to Notion."""
+    """Write stored postings to a file format or to Notion.
+
+    Covers the same postings `list` shows, and takes the same options to
+    change that: an export that quietly carried more than the table did
+    would make the table a lie.
+    """
     if output is not None and fmt == "notion":
         _err.print("[yellow]--output is ignored for the notion exporter.[/yellow]")
 
-    filters = PostingFilters(
+    filters = _posting_filters(
+        ctx,
         source=source,
-        status=ApplicationStatus(status) if status else None,
+        status=status,
         min_score=min_score,
         max_score=max_score,
         remote=remote,
+        unscored=unscored,
+        languages=languages,
     )
     with ctx.open_storage() as storage:
         pipeline = ctx.pipeline(storage)
@@ -477,6 +485,7 @@ def export(
 @click.option("--source", "sources", multiple=True, help="Fetch only these sources (repeatable).")
 @click.option("--format", "formats", multiple=True, help="Export only these formats (repeatable).")
 @click.option("--score-limit", type=click.IntRange(min=1), default=None)
+@click.option("--language", "languages", multiple=True, help=_LANGUAGE_HELP)
 @click.option("--skip-fetch", is_flag=True)
 @click.option("--skip-score", is_flag=True)
 @click.option("--skip-export", is_flag=True)
@@ -486,11 +495,13 @@ def run(
     sources: tuple[str, ...],
     formats: tuple[str, ...],
     score_limit: int | None,
+    languages: tuple[str, ...],
     skip_fetch: bool,
     skip_score: bool,
     skip_export: bool,
 ) -> None:
     """Fetch, then score, then export - one command, cron-friendly."""
+    filters = _posting_filters(ctx, languages=languages)
     with ctx.open_storage() as storage:
         pipeline = ctx.pipeline(storage)
         try:
@@ -498,6 +509,7 @@ def run(
                 only_sources=list(sources) or None,
                 formats=list(formats) or None,
                 score_limit=score_limit,
+                filters=filters,
                 skip_fetch=skip_fetch,
                 skip_score=skip_score,
                 skip_export=skip_export,
@@ -739,6 +751,41 @@ def _render_export(outcomes: list[ExportOutcome], *, dry_run: bool) -> None:
 # --------------------------------------------------------------------------
 # Small pure helpers
 # --------------------------------------------------------------------------
+
+
+def _posting_filters(
+    ctx: AppContext,
+    *,
+    source: str | None = None,
+    status: str | None = None,
+    min_score: int | None = None,
+    max_score: int | None = None,
+    remote: bool = False,
+    unscored: bool = False,
+    languages: tuple[str, ...] = (),
+) -> PostingFilters:
+    """Build the read scope shared by `list`, `export` and `run`.
+
+    One builder rather than one per command, so the set of postings a
+    command shows and the set another one writes out cannot drift apart.
+
+    Raises:
+        click.UsageError: If ``unscored`` is combined with a score bound,
+            which can only ever match nothing.
+    """
+    if unscored and (min_score is not None or max_score is not None):
+        raise click.UsageError("--unscored cannot be combined with --min-score/--max-score.")
+
+    configured = ctx.load_config().search.languages
+    return PostingFilters(
+        source=source,
+        status=ApplicationStatus(status) if status else None,
+        min_score=min_score,
+        max_score=max_score,
+        scored=False if unscored else None,
+        languages=_resolve_languages(languages, configured),
+        remote=remote,
+    )
 
 
 def _resolve_languages(requested: tuple[str, ...], configured: list[str]) -> tuple[str, ...] | None:

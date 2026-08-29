@@ -27,13 +27,18 @@ pip install .
 This puts a `jobsearcher` command on your path. Python 3.11 or newer is
 required.
 
-Optional extras:
+That one install is all of JobSearcher. The two optional features — the
+[LLM scorer](#the-optional-llm-scorer-llm) and the [Notion
+exporter](#the-optional-notion-exporter) — ship with it and are switched on
+in `config.yaml`. Neither needs a second install; each needs one credential
+in your environment, and the sections below say which.
 
-| Extra                            | What it adds                                              |
-| -------------------------------- | -------------------------------------------------------- |
-| `pip install ".[llm]"`           | The LLM scorer (`scoring.backend: llm`).                 |
-| `pip install ".[notion]"`        | The Notion exporter (`jobsearcher export notion`).       |
-| `pip install ".[dev]"`           | pytest, ruff, mypy — for working on JobSearcher itself.  |
+Working on JobSearcher itself needs the development tools (pytest, ruff,
+mypy):
+
+```bash
+pip install -e ".[dev]"
+```
 
 Then create a configuration file:
 
@@ -167,8 +172,10 @@ required field; the sections below fill in the rest.
   the posting, and if any include terms are set at least one must appear.
   `languages` is *not* a collection filter — every posting is kept and
   tagged with a best-effort detected language (`en`/`fr`/`de`/`es`, or blank
-  when undetermined); this list is only the default filter `jobsearcher
-  list` applies at display time, overridable per run with `--language`.
+  when undetermined); this list is the default scope of the commands that
+  read them back. `jobsearcher list`, `jobsearcher export` and `jobsearcher
+  run` all apply it, so the table and the exported file cover the same
+  postings; `--language <code>` narrows it and `--language all` drops it.
 
 - **`profile`** — the scoring criteria. `skills` is the set the scorer looks
   for in each posting; `absent_skills` are technologies you want to avoid,
@@ -295,11 +302,8 @@ were penalized — is stored per posting and shown by `jobsearcher show`.
 ### The optional LLM scorer (`llm`)
 
 A bonus for refining a bounded number of postings with a language model.
-Install the extra and switch the backend:
-
-```bash
-pip install ".[llm]"
-```
+Nothing to install: point the `scoring:` block at the `llm` backend and put
+an API key in your environment.
 
 ```yaml
 scoring:
@@ -307,19 +311,81 @@ scoring:
   base_url: "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
   model: "gpt-4o-mini"
   api_key_env: "OPENAI_API_KEY"           # the key is read from this env var, never from config
-  max_postings_per_run: 25                # hard cap on calls per `jobsearcher score`
+  max_requests_per_run: 25                # hard cap on API calls per `jobsearcher score`
+  max_description_chars: 4000             # how much of each description to send
 ```
 
 ```bash
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY=sk-...   # the variable named by api_key_env
 jobsearcher score
 ```
 
 The API key is only ever read from the environment variable named by
-`api_key_env`. `max_postings_per_run` bounds the cost: once it is reached the
-scoring phase stops cleanly and leaves the rest for the next run. Unlike the
-keyword scorer, the LLM scorer also reads *stated requirements* out of the
-posting text and reports the ones your profile does not cover.
+`api_key_env`. Cost is bounded on both axes: `max_requests_per_run` caps how
+many API calls a run may make — calls, not postings, since a posting whose
+first reply is unusable is retried once and costs two — and once it is
+reached the scoring phase stops cleanly and leaves the rest for the next run;
+`max_description_chars` caps how much of each posting description travels in
+a call, so one verbose ad cannot cost a multiple of every other. A request
+the endpoint refuses permanently (a 400, a 401) is not retried; a timeout, a
+429, or a 5xx is. Unlike the keyword scorer, the LLM scorer also reads
+*stated requirements* out of the posting text and reports the ones your
+profile does not cover.
+
+## Exporting
+
+`jobsearcher export <format>` writes the stored postings out, sorted by
+score with the highest first and unscored last. `markdown`, `csv`, and
+`json` use only the standard library and write to the `output_path` in their
+`exporters:` block, or to `--output`.
+
+An export covers the same postings `jobsearcher list` shows, and takes the
+same options to change that: `--language`, `--source`, `--status`,
+`--remote`, `--min-score`, `--max-score`, `--unscored`.
+
+In the CSV, a cell that would open a formula (`=`, `+`, `-`, `@`) is written
+with a leading apostrophe — the convention spreadsheets use for "this is
+text". Posting titles come off the web, and this file is meant to be opened
+in Excel or Sheets.
+
+### The optional Notion exporter
+
+`jobsearcher export notion` keeps one Notion database page per posting,
+matched by URL so re-exporting updates the page rather than duplicating it,
+and writes your application status to a select property so you can board it
+inside Notion. Nothing to install, but it does need setting up on the Notion
+side:
+
+1. Create an internal integration at
+   <https://www.notion.so/my-integrations> and copy its secret.
+2. Export that secret as the environment variable named by `api_key_env`
+   (default `NOTION_API_KEY`). The token is never read from `config.yaml`.
+3. Share the target database with the integration: open the database in
+   Notion → ••• → Connections → add your integration.
+4. Give the database the six properties JobSearcher writes, with these exact
+   types: `Name` (title), `URL` (url), `Status` (select), `Company` (text),
+   `Score` (number), `Source` (select). If yours are named differently,
+   point the matching `*_property` option at them instead.
+
+```yaml
+exporters:
+  notion:
+    enabled: true
+    database_id: "your-notion-database-id"   # from the database URL, before `?v=`
+    api_key_env: "NOTION_API_KEY"
+    requests_per_second: 2.5                 # just under Notion's documented ceiling
+```
+
+```bash
+export NOTION_API_KEY=secret_...
+jobsearcher export notion
+```
+
+The schema is checked before anything is written, and every missing or
+mistyped property is named. Writing is paced to `requests_per_second`
+because each posting costs two requests; if an export is interrupted anyway,
+the error says how many pages it had already created and updated, and
+running it again resumes from there without duplicating them.
 
 ## Architecture
 
@@ -368,14 +434,15 @@ score is never silently clobbered by a rescrape.
   anything being wrong — the score is "how much overlap is *visible* in the
   text", not a judgement on the job.
 - **LLM scoring costs API calls.** Every posting it scores is a paid request
-  to your endpoint. `max_postings_per_run` is the only guardrail; there is
-  no caching of verdicts between runs.
+  to your endpoint — two, when the first reply is unusable and the retry
+  fires. `max_requests_per_run` and `max_description_chars` are the only
+  guardrails; there is no caching of verdicts between runs.
 - **Notion needs manual setup on the Notion side.** You must create an
   internal integration, share the target database with it, and create the
-  database properties JobSearcher writes (`Name`/title, `URL`/url,
-  `Status`/select, `Company`/text, `Score`/number, `Source`/select) with
-  those exact types. JobSearcher checks the schema up front and names each
-  missing or mistyped property, but it cannot create them for you.
+  six database properties JobSearcher writes with the exact types listed
+  under [The optional Notion exporter](#the-optional-notion-exporter).
+  JobSearcher checks the schema up front and names each missing or mistyped
+  property, but it cannot create them for you.
 - **Stored postings are not refreshed.** Once a posting's URL is in the
   database, a later fetch leaves its title, description, and other fields
   untouched even if the source changed them. This is deliberate for v1 (it

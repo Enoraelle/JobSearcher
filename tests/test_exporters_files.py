@@ -85,6 +85,57 @@ def test_csv_renders_missing_optional_fields_as_empty(tmp_path: Path) -> None:
     assert row["summary"] == ""
 
 
+@pytest.mark.parametrize("lead", ["=", "+", "-", "@"])
+def test_csv_defuses_cells_a_spreadsheet_would_run_as_a_formula(tmp_path: Path, lead: str) -> None:
+    """Titles come from the web, and the CSV is meant for a spreadsheet."""
+    path = tmp_path / "jobs.csv"
+    title = f'{lead}HYPERLINK("http://evil.test","Backend Engineer")'
+    CsvExporter().export([_posting(title=title)], _opts(output_path=str(path)))
+
+    row = next(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+    assert row["title"] == f"'{title}"
+
+
+def test_csv_defuses_every_web_sourced_column(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.csv"
+    posting = _posting(
+        title="=cmd|'/c calc'!A1",
+        company="@SUM(1+9)",
+        location="+1-555-0100",
+        summary="-2+3",
+        matched_skills=["=1+1"],
+    )
+    CsvExporter().export([posting], _opts(output_path=str(path)))
+
+    row = next(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+    assert row["title"] == "'=cmd|'/c calc'!A1"
+    assert row["company"] == "'@SUM(1+9)"
+    assert row["location"] == "'+1-555-0100"
+    assert row["summary"] == "'-2+3"
+    assert row["matched_skills"] == "'=1+1"
+
+
+def test_csv_leaves_ordinary_cells_alone(tmp_path: Path) -> None:
+    path = tmp_path / "jobs.csv"
+    CsvExporter().export(
+        [_posting(title="Backend Engineer", score=90)], _opts(output_path=str(path))
+    )
+
+    row = next(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+    assert row["title"] == "Backend Engineer"
+    assert row["score"] == "90"
+    assert not row["url"].startswith("'")
+
+
+def test_json_does_not_escape_formula_characters(tmp_path: Path) -> None:
+    """The apostrophe is a spreadsheet convention; JSON is read by programs."""
+    path = tmp_path / "jobs.json"
+    JsonExporter().export([_posting(title="=1+1")], _opts(output_path=str(path)))
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["postings"][0]["title"] == "=1+1"
+
+
 def test_csv_with_no_postings_still_writes_a_header(tmp_path: Path) -> None:
     path = tmp_path / "jobs.csv"
     CsvExporter().export([], _opts(output_path=str(path)))

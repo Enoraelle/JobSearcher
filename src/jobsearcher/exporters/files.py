@@ -1,6 +1,6 @@
 """Offline file exporters: CSV, JSON, and Markdown.
 
-These three use only the standard library — no extra to install. They share
+These three use only the standard library. They share
 one option, ``output_path`` (where to write), and one ordering rule: postings come
 out sorted by score, highest first, with unscored postings last. That order
 is the point of an export (you read the top of the list first), so it is
@@ -8,7 +8,10 @@ applied to every format, not just the human-readable one.
 
 - **CSV** (:class:`CsvExporter`): one row per posting, a fixed column set,
   list-valued fields joined with ``"; "`` so every cell is a scalar. For
-  spreadsheets and quick filtering.
+  spreadsheets and quick filtering — which is why a cell that would open a
+  formula is prefixed with an apostrophe first (see :func:`_defuse_formula`);
+  the text in it came off the web and this file is meant to be opened in
+  Excel or Sheets.
 - **JSON** (:class:`JsonExporter`): a ``{"count": N, "postings": [...]}``
   object; list fields stay lists and datetimes are ISO-8601 strings. For
   feeding another tool.
@@ -60,6 +63,10 @@ _LIST_FIELDS: frozenset[str] = frozenset(
 
 _LIST_SEPARATOR = "; "
 
+# Excel, LibreOffice and Google Sheets all read a cell starting with one of
+# these as a formula rather than as text.
+_FORMULA_LEADS: tuple[str, ...] = ("=", "+", "-", "@")
+
 
 class _FileOptions(BaseModel):
     """The ``exporters.<name>`` block for a file exporter.
@@ -102,6 +109,41 @@ def _explain_options_error(exc: ValidationError) -> str:
     return "invalid file exporter configuration: " + "; ".join(parts)
 
 
+def _defuse_formula(value: str) -> str:
+    """Stop a spreadsheet from evaluating a cell that came off the web.
+
+    Titles, companies and descriptions are scraped text, and a cell opening
+    with ``=``, ``+``, ``-`` or ``@`` is a formula to every major spreadsheet
+    — including ones that fetch a remote URL. Prefixing an apostrophe is the
+    convention those applications use to mean "this is text"; they strip it
+    on display and it costs nothing to a program reading the file.
+
+    Args:
+        value: One cell's text.
+
+    Returns:
+        ``value``, prefixed with an apostrophe if it would otherwise be read
+        as a formula.
+    """
+    if value.startswith(_FORMULA_LEADS):
+        return f"'{value}"
+    return value
+
+
+def _flatten_cell(value: Any) -> Any:
+    """Render one record value as a CSV cell.
+
+    Missing values become empty cells, and text is defused first (see
+    :func:`_defuse_formula`); numbers pass through as they are, so the
+    ``score`` column stays numeric.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _defuse_formula(value)
+    return value
+
+
 def _by_score(postings: Iterable[JobPosting]) -> list[JobPosting]:
     """Sort postings by score descending, unscored last, ties broken by title."""
     return sorted(
@@ -115,9 +157,12 @@ def _record(posting: JobPosting, *, flatten: bool) -> dict[str, Any]:
 
     Args:
         posting: The posting to render.
-        flatten: If true (CSV), join list fields into a single string and
-            replace ``None`` with ``""``. If false (JSON), keep lists as
-            lists and ``None`` as ``null``.
+        flatten: If true (CSV), join list fields into a single string,
+            replace ``None`` with ``""``, and defuse cells a spreadsheet
+            would evaluate as formulas. If false (JSON), keep lists as
+            lists and ``None`` as ``null``, and leave text exactly as
+            stored — the apostrophe is a spreadsheet convention and would
+            be data corruption to a program reading the JSON.
     """
     published_at = posting.published_at.isoformat() if posting.published_at else None
     record: dict[str, Any] = {
@@ -140,7 +185,7 @@ def _record(posting: JobPosting, *, flatten: bool) -> dict[str, Any]:
     if flatten:
         for key in _LIST_FIELDS:
             record[key] = _LIST_SEPARATOR.join(record[key])
-        record = {key: ("" if value is None else value) for key, value in record.items()}
+        record = {key: _flatten_cell(value) for key, value in record.items()}
     return record
 
 

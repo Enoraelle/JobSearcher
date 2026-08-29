@@ -50,8 +50,7 @@ class Scorer(Protocol):
 
         Implementations must be free of side effects and must not perform
         network I/O unless they are explicitly an online scorer (see
-        ``llm.py``, which is gated behind the ``llm`` extra and a per-run
-        budget).
+        ``llm.py``, which is gated behind a per-run budget).
 
         Args:
             posting: The posting to score.

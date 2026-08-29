@@ -1,4 +1,4 @@
-"""Optional LLM-backed scorer, gated behind the ``llm`` extra and a budget.
+"""Optional LLM-backed scorer, gated behind a budget.
 
 This scorer is a **bonus**. JobSearcher scores every posting with the
 offline :class:`~jobsearcher.scoring.keyword.KeywordScorer` by default and
@@ -16,17 +16,27 @@ keys" rule:
   variable whose name is config (``api_key_env``, default
   ``OPENAI_API_KEY``). It is never read from the config file, which is
   version-controlled.
-- **Bounded cost.** ``max_postings_per_run`` caps how many postings this
-  scorer will spend a call on. Once the cap is hit, :meth:`LlmScorer.score`
-  raises :class:`BudgetExhaustedError` so the caller can fall back to the keyword
-  score.
+- **Bounded cost, on both axes.** ``max_requests_per_run`` caps how many
+  requests this scorer will make — requests, not postings, because a
+  retried posting costs two of them and a budget that counted postings
+  would quietly authorize twice the spend. Once the cap is hit,
+  :meth:`LlmScorer.score` raises :class:`BudgetExhaustedError` so the
+  caller can fall back to the keyword score. ``max_description_chars``
+  caps the other axis: the budget bounds how many calls go out, and only
+  truncation bounds what each one costs, since postings carry
+  descriptions of no fixed length.
 - **Structured, validated output.** The model is asked for JSON; the reply
   is parsed into :class:`_LlmVerdict` (pydantic). An invalid reply is
   retried once and then given up on with :class:`LlmScoringError` — the
   posting is left unscored rather than scored from a guess.
-- **Friendly missing-dependency error.** Importing this module without the
-  ``llm`` extra installed raises with "install jobsearcher[llm] to use this
-  scorer", not a bare ``ImportError``.
+- **Retries only where a retry can help.** A timeout or a 429/5xx is worth
+  a second attempt; a 400 or a 401 is a permanent refusal, and paying for
+  a second identical call cannot change it. Those fail immediately.
+
+Nothing here needs installing: this scorer speaks plain HTTP to an
+OpenAI-compatible endpoint with the ``httpx`` the rest of the package
+already uses. Switching ``scoring.backend`` to ``llm`` and exporting the key
+is all it takes.
 """
 
 from __future__ import annotations
@@ -36,11 +46,8 @@ import os
 from types import TracebackType
 from typing import Any, Final
 
-try:  # The ``llm`` extra's dependencies. Keep this the only place they enter.
-    import httpx
-    from pydantic import BaseModel, ConfigDict, Field, ValidationError
-except ModuleNotFoundError as exc:  # pragma: no cover - deps ship with the base package today
-    raise ModuleNotFoundError("install jobsearcher[llm] to use this scorer") from exc
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult
@@ -55,10 +62,23 @@ _DEFAULT_MODEL: Final = "gpt-4o-mini"
 _DEFAULT_KEY_ENV: Final = "OPENAI_API_KEY"
 _DEFAULT_BUDGET: Final = 25
 _DEFAULT_TIMEOUT: Final = 30.0
+# Roughly a thousand tokens of description: enough for the requirements
+# section of a long posting, without letting one verbose ad cost a multiple
+# of every other call.
+_DEFAULT_MAX_DESCRIPTION_CHARS: Final = 4000
 
 # One initial attempt plus one retry: a model that returns malformed JSON
 # twice in a row is not worth a third round trip.
 _MAX_ATTEMPTS: Final = 2
+
+# Worth a second attempt: the same request may well succeed later. Every
+# other non-2xx status is a permanent refusal (bad key, bad model name,
+# malformed request) that a retry only pays for twice.
+_RETRYABLE_STATUS_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+
+# Pre-rename spelling of `max_requests_per_run`, kept only to be rejected
+# with an explanation. See LlmScorerConfig._explain_renamed_budget.
+_LEGACY_BUDGET_KEY: Final = "max_postings_per_run"
 
 _SYSTEM_PROMPT: Final = (
     "You score how well a job posting fits a candidate profile. "
@@ -80,7 +100,7 @@ class LlmScoringError(RuntimeError):
 
 
 class BudgetExhaustedError(ScorerBudgetExhaustedError):
-    """The per-run posting budget for the LLM scorer has been spent.
+    """The per-run request budget for the LLM scorer has been spent.
 
     Subclasses the backend-neutral
     :class:`~jobsearcher.scoring.base.ScorerBudgetExhaustedError` so the pipeline
@@ -114,8 +134,46 @@ class LlmScorerConfig(BaseModel):
     base_url: str = _DEFAULT_BASE_URL
     model: str = _DEFAULT_MODEL
     api_key_env: str = _DEFAULT_KEY_ENV
-    max_postings_per_run: int = Field(default=_DEFAULT_BUDGET, ge=0)
+    max_requests_per_run: int = Field(default=_DEFAULT_BUDGET, ge=0)
+    """Hard cap on API calls per run, retries included. ``0`` disables scoring."""
+
+    max_description_chars: int = Field(default=_DEFAULT_MAX_DESCRIPTION_CHARS, ge=0)
+    """How much of a posting description to send. ``0`` sends all of it."""
+
     timeout: float = Field(default=_DEFAULT_TIMEOUT, gt=0.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explain_renamed_budget(cls, data: Any) -> Any:
+        """Turn the old budget key into a migration message, not "extra input".
+
+        ``max_postings_per_run`` was not merely renamed: it capped postings
+        and now caps requests. Left to ``extra="forbid"``, the config would
+        be refused with "Extra inputs are not permitted" — true, and useless:
+        it names neither the new key nor the change of meaning, so someone
+        would rename 25 to 25 and believe they had migrated while their
+        budget silently changed nature.
+
+        Args:
+            data: The raw ``scoring:`` mapping, before field validation.
+
+        Returns:
+            ``data`` unchanged when it carries no legacy key.
+
+        Raises:
+            ValueError: If ``max_postings_per_run`` is present.
+        """
+        # `mode="before"` hands over whatever the caller passed, hence Any.
+        if isinstance(data, dict) and _LEGACY_BUDGET_KEY in data:
+            raise ValueError(
+                f"`{_LEGACY_BUDGET_KEY}` is now `max_requests_per_run`, and it counts "
+                "something else: the budget caps API requests, not postings, because a "
+                "posting whose first reply is unusable is retried once and costs two. "
+                "Renaming the key is not enough: choose the number of requests you "
+                "want to pay for per run, which for the same number of postings is up "
+                "to twice the old value."
+            )
+        return data
 
 
 def _extract_json_object(content: str) -> str:
@@ -127,6 +185,50 @@ def _extract_json_object(content: str) -> str:
             text = text[4:]
         text = text.split("```", 1)[0]
     return text.strip()
+
+
+def _explain_config_error(exc: ValidationError) -> str:
+    """Render a config failure as one line the user can act on.
+
+    Same shape as the exporters' explainers: pydantic's own rendering
+    ("1 validation error for LlmScorerConfig ... [type=..., input_value=...]")
+    buries the part that matters, including the messages this module's own
+    validators wrote for the user.
+
+    Args:
+        exc: The failure raised while validating the ``scoring:`` block.
+
+    Returns:
+        A single message naming every problem and what to change.
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error["loc"])
+        if error["type"] == "value_error":
+            # Raised by a validator in this module: already user-facing.
+            parts.append(error["msg"].removeprefix("Value error, "))
+        elif error["type"] == "extra_forbidden":
+            parts.append(f"unknown option `{location}` (check for a typo)")
+        else:
+            parts.append(f"`{location}`: {error['msg']}")
+    return "invalid `llm` scorer configuration: " + "; ".join(parts)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cut ``text`` to at most ``limit`` characters, marking that it was cut.
+
+    Args:
+        text: The text to bound.
+        limit: The maximum length, or ``0`` for no limit.
+
+    Returns:
+        ``text`` unchanged when it already fits, otherwise its first
+        ``limit`` characters with the last one replaced by an ellipsis so
+        the model can tell the description was cut short.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "\u2026"
 
 
 class LlmScorer:
@@ -155,7 +257,7 @@ class LlmScorer:
         try:
             self._config = LlmScorerConfig.model_validate(config.model_dump())
         except ValidationError as exc:
-            raise ValueError(f"Invalid LLM scorer configuration: {exc}") from exc
+            raise ValueError(_explain_config_error(exc)) from exc
 
         api_key = os.environ.get(self._config.api_key_env, "").strip()
         if not api_key:
@@ -167,7 +269,7 @@ class LlmScorer:
 
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=self._config.timeout)
-        self._scored = 0
+        self._requests = 0
 
     def close(self) -> None:
         """Close the underlying HTTP client, if this instance owns one."""
@@ -196,20 +298,14 @@ class LlmScorer:
             The model's verdict, merged with the shared eligibility checks.
 
         Raises:
-            BudgetExhaustedError: If ``max_postings_per_run`` has already been
-                reached this run.
-            LlmScoringError: If the model does not return a valid verdict
-                within :data:`_MAX_ATTEMPTS` attempts.
+            BudgetExhaustedError: If ``max_requests_per_run`` has already
+                been reached this run, or is reached partway through this
+                posting's attempts.
+            LlmScoringError: If the model refuses the request permanently,
+                or does not return a valid verdict within
+                :data:`_MAX_ATTEMPTS` attempts.
         """
-        if self._scored >= self._config.max_postings_per_run:
-            raise BudgetExhaustedError(
-                f"LLM scorer budget of {self._config.max_postings_per_run} "
-                f"posting(s) per run is spent"
-            )
-        # Count the attempt before the call: a failed call still costs money,
-        # so it must count against the budget.
-        self._scored += 1
-
+        self._ensure_budget()
         verdict = self._request_verdict(posting, profile)
         matched = set(verdict.matched_skills)
         return ScoreResult(
@@ -223,18 +319,43 @@ class LlmScorer:
             work_mode_match=evaluate_work_mode_match(posting, profile),
         )
 
+    def _ensure_budget(self) -> None:
+        """Raise unless at least one more request fits in this run's budget."""
+        if self._requests >= self._config.max_requests_per_run:
+            raise BudgetExhaustedError(
+                f"LLM scorer budget of {self._config.max_requests_per_run} "
+                f"request(s) per run is spent"
+            )
+
     def _request_verdict(self, posting: JobPosting, profile: ProfileConfig) -> _LlmVerdict:
         payload = self._build_payload(posting, profile)
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
         last_error = "no attempt made"
-        for _ in range(_MAX_ATTEMPTS):
+        for attempt in range(_MAX_ATTEMPTS):
+            if attempt:
+                # A retry is another paid call, so it has to fit in the
+                # budget like the first one did.
+                self._ensure_budget()
+            # Count the attempt before the call: a failed call still costs
+            # money, so it must count against the budget.
+            self._requests += 1
             try:
                 response = self._client.post(url, headers=headers, json=payload)
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]
                 return _LlmVerdict.model_validate_json(_extract_json_object(content))
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status not in _RETRYABLE_STATUS_CODES:
+                    raise LlmScoringError(
+                        f"the model at {self._config.base_url} refused the request "
+                        f"with HTTP {status}; retrying would cost another call and "
+                        f"return the same answer. Check `api_key_env` "
+                        f"({self._config.api_key_env}), `base_url` and `model`."
+                    ) from exc
+                last_error = f"{type(exc).__name__}: {exc}"
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
                 # pydantic's ValidationError is a ValueError subclass, so a
                 # malformed reply and a schema-violating one both land here.
@@ -246,7 +367,10 @@ class LlmScorer:
         )
 
     def _build_payload(self, posting: JobPosting, profile: ProfileConfig) -> dict[str, Any]:
-        description = posting.description_clean or posting.description_raw
+        description = _truncate(
+            posting.description_clean or posting.description_raw,
+            self._config.max_description_chars,
+        )
         user_prompt = json.dumps(
             {
                 "profile": {

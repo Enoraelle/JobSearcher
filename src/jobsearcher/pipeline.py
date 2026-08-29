@@ -340,7 +340,7 @@ class Pipeline:
         """
         try:
             scorer = get_scorer(self._config.scoring)
-        except (ScoringConfigError, ModuleNotFoundError, ValueError) as exc:
+        except (ScoringConfigError, ValueError) as exc:
             raise PipelineError(str(exc)) from exc
 
         profile = self._config.profile
@@ -433,7 +433,7 @@ class Pipeline:
 
         try:
             exporter = get_exporter(name)
-        except (ExporterConfigError, ModuleNotFoundError) as exc:
+        except ExporterConfigError as exc:
             return ExportOutcome(name, error=str(exc))
 
         options = block

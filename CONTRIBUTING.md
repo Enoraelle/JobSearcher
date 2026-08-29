@@ -17,8 +17,10 @@ The `dev` extra pulls in pytest, pytest-cov, ruff, and mypy. The `-e`
 (editable) install means your source changes take effect without a
 reinstall. The `jobsearcher` command is on your path from here.
 
-To exercise the optional scorer and exporter, add their extras too:
-`pip install -e ".[dev,llm,notion]"`.
+The optional LLM scorer and Notion exporter need nothing extra installed:
+both speak plain HTTP through the same `httpx` as the rest of the package.
+Their tests are fully mocked, so you do not need an API key or a Notion
+token to run the suite either.
 
 ## The checks
 
@@ -306,10 +308,11 @@ Unlike sources, scorers are **not** auto-registered — `get_scorer` in
    pipeline catches it and ends the phase cleanly, leaving the rest for a
    later run — it is not a failure.
 5. Wire it into `get_scorer`: add a branch for your `backend` value, and
-   import your module *inside that branch* if it depends on an optional
-   extra (see how `llm` is imported lazily).
+   import your module *inside that branch* if it talks to a paid or
+   third-party service, so the default offline path never pays to import it
+   (see how `llm` is imported lazily).
 6. Document the config block in `src/jobsearcher/config.example.yaml`,
-   commented out if it needs an extra or a key.
+   commented out if it needs a key.
 7. Test it offline. For an HTTP-backed scorer, inject an
    `httpx.MockTransport` client (see
    [`tests/test_scoring_llm.py`](tests/test_scoring_llm.py)); assert on the
@@ -342,8 +345,8 @@ add one:
    the postings.
 4. Register it in
    [`exporters/__init__.py`](src/jobsearcher/exporters/__init__.py): add it
-   to `_BUILTIN_EXPORTERS` (always-importable formats) or give it a lazy
-   branch in `get_exporter` (formats behind an extra, like `notion`). Either
+   to `_BUILTIN_EXPORTERS` (offline formats) or give it a lazy branch in
+   `get_exporter` (formats that talk to a service, like `notion`). Either
    way it must appear in `EXPORTER_FORMATS`, which drives the CLI's format
    validation and help text.
 5. Document the config block in `src/jobsearcher/config.example.yaml`.

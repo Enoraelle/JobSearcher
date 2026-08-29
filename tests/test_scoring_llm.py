@@ -84,6 +84,16 @@ class _FakeResponse:
         return self._json_data
 
 
+def _status_error(status: int) -> _FakeResponse:
+    """A response whose ``raise_for_status`` raises the given HTTP status."""
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    return _FakeResponse(
+        status_error=httpx.HTTPStatusError(
+            f"{status}", request=request, response=httpx.Response(status, request=request)
+        )
+    )
+
+
 class _FakeClient:
     """Serves a scripted list of responses (or exceptions) to ``.post``."""
 
@@ -227,12 +237,12 @@ def test_schema_violation_in_reply_is_treated_as_invalid(monkeypatch: pytest.Mon
         _scorer(client).score(_posting(), _profile())
 
 
-def test_http_error_is_retried_then_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_a_transient_http_error_is_retried_then_surfaced(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
     _with_key(monkeypatch)
-    client = _FakeClient(
-        _FakeResponse(status_error=httpx.HTTPError("503")),
-        _FakeResponse(status_error=httpx.HTTPError("503")),
-    )
+    client = _FakeClient(_status_error(status), _status_error(status))
 
     with pytest.raises(LlmScoringError):
         _scorer(client).score(_posting(), _profile())
@@ -240,15 +250,39 @@ def test_http_error_is_retried_then_surfaced(monkeypatch: pytest.MonkeyPatch) ->
     assert len(client.calls) == 2
 
 
+def test_a_network_error_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_key(monkeypatch)
+    client = _FakeClient(httpx.ConnectError("no route to host"), _completion(_verdict_json()))
+
+    result = _scorer(client).score(_posting(), _profile())
+
+    assert result.score == 82
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_a_permanent_http_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A second call for a 400 or a 401 is money spent on a certain failure."""
+    _with_key(monkeypatch)
+    client = _FakeClient(_status_error(status), _completion(_verdict_json()))
+
+    with pytest.raises(LlmScoringError, match=str(status)):
+        _scorer(client).score(_posting(), _profile())
+
+    assert len(client.calls) == 1
+
+
 # --------------------------------------------------------------------------
 # Budget
 # --------------------------------------------------------------------------
 
 
-def test_budget_caps_the_number_of_postings_scored(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_budget_caps_the_number_of_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
     client = _FakeClient(_completion(_verdict_json()), _completion(_verdict_json()))
-    scorer = _scorer(client, max_postings_per_run=1)
+    scorer = _scorer(client, max_requests_per_run=1)
 
     scorer.score(_posting(url="https://example.com/jobs/a"), _profile())
     with pytest.raises(BudgetExhaustedError):
@@ -260,12 +294,50 @@ def test_budget_caps_the_number_of_postings_scored(monkeypatch: pytest.MonkeyPat
 def test_a_failed_call_still_counts_against_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
     client = _FakeClient(_completion("bad"), _completion("bad"))
-    scorer = _scorer(client, max_postings_per_run=1)
+    scorer = _scorer(client, max_requests_per_run=1)
 
-    with pytest.raises(LlmScoringError):
+    with pytest.raises(BudgetExhaustedError):
         scorer.score(_posting(url="https://example.com/jobs/a"), _profile())
+    assert len(client.calls) == 1
+
+
+def test_a_retry_is_charged_to_the_budget_like_any_other_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two attempts per posting must not buy twice the configured budget."""
+    _with_key(monkeypatch)
+    client = _FakeClient(
+        _completion("bad"),
+        _completion(_verdict_json()),
+        _completion("bad"),
+        _completion(_verdict_json()),
+    )
+    scorer = _scorer(client, max_requests_per_run=3)
+
+    # First posting: one wasted call plus one good one.
+    scorer.score(_posting(url="https://example.com/jobs/a"), _profile())
+    # Second posting: only one call left, so its retry is never bought.
     with pytest.raises(BudgetExhaustedError):
         scorer.score(_posting(url="https://example.com/jobs/b"), _profile())
+
+    assert len(client.calls) == 3
+
+
+def test_the_old_budget_key_explains_the_rename_and_the_new_meaning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ "Extra inputs are not permitted" is true and useless here."""
+    _with_key(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        _scorer(_FakeClient(), max_postings_per_run=25)
+
+    message = str(excinfo.value)
+    assert "max_postings_per_run" in message
+    assert "max_requests_per_run" in message
+    # The value changed meaning, so renaming the key is not a migration.
+    assert "request" in message and "posting" in message
+    assert "Extra inputs are not permitted" not in message
 
 
 def test_zero_budget_scores_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,7 +345,66 @@ def test_zero_budget_scores_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeClient()
 
     with pytest.raises(BudgetExhaustedError):
-        _scorer(client, max_postings_per_run=0).score(_posting(), _profile())
+        _scorer(client, max_requests_per_run=0).score(_posting(), _profile())
+
+
+# --------------------------------------------------------------------------
+# Prompt size
+# --------------------------------------------------------------------------
+
+
+def _sent_description(client: _FakeClient) -> str:
+    """The posting description as it left for the model."""
+    user_message = client.calls[0]["json"]["messages"][1]["content"]
+    description: str = json.loads(user_message)["posting"]["description"]
+    return description
+
+
+def test_a_long_description_is_truncated_before_it_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The budget bounds the number of calls; only this bounds their size."""
+    _with_key(monkeypatch)
+    client = _FakeClient(_completion(_verdict_json()))
+    posting = _posting(description_clean="word " * 5000)
+
+    _scorer(client, max_description_chars=200).score(posting, _profile())
+
+    sent = _sent_description(client)
+    assert len(sent) <= 200
+    assert sent.endswith("…")
+
+
+def test_descriptions_are_truncated_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_key(monkeypatch)
+    client = _FakeClient(_completion(_verdict_json()))
+
+    _scorer(client).score(_posting(description_clean="word " * 20000), _profile())
+
+    assert len(_sent_description(client)) < 20000
+
+
+def test_a_short_description_is_sent_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_key(monkeypatch)
+    client = _FakeClient(_completion(_verdict_json()))
+
+    _scorer(client, max_description_chars=200).score(
+        _posting(description_clean="Short and sweet."), _profile()
+    )
+
+    assert _sent_description(client) == "Short and sweet."
+
+
+def test_truncation_can_be_turned_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_key(monkeypatch)
+    client = _FakeClient(_completion(_verdict_json()))
+    description = "word " * 5000
+
+    _scorer(client, max_description_chars=0).score(
+        _posting(description_clean=description), _profile()
+    )
+
+    assert _sent_description(client) == description
 
 
 # --------------------------------------------------------------------------

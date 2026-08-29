@@ -8,9 +8,9 @@ the same one-way dependency rule (see CLAUDE.md): it depends on
 nothing about scraping, scoring, or storage internals.
 
 Implementations live one per module in this package. The offline file
-formats (``files.py``) are always importable; :class:`NotionExporter`
-(``notion.py``) is a bonus behind the ``notion`` extra and is imported on
-demand, never from this package's ``__init__``.
+formats (``files.py``) write to disk and cost nothing; :class:`NotionExporter`
+(``notion.py``) talks to a third-party service and is imported on demand,
+never from this package's ``__init__``.
 
 Every failure an exporter reports to its caller is an :class:`ExporterError`
 whose message is *actionable*: it names the option to set, the path that

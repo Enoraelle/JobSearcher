@@ -4,8 +4,8 @@ The file formats (:class:`~jobsearcher.exporters.files.CsvExporter`,
 :class:`~jobsearcher.exporters.files.JsonExporter`,
 :class:`~jobsearcher.exporters.files.MarkdownExporter`) use only the standard
 library and are always importable.
-:class:`~jobsearcher.exporters.notion.NotionExporter` is a bonus behind the
-``notion`` extra and is imported on demand — :func:`get_exporter` is the
+:class:`~jobsearcher.exporters.notion.NotionExporter` talks to a
+third-party service and is imported on demand — :func:`get_exporter` is the
 only place that reaches for it.
 """
 
@@ -14,8 +14,8 @@ from __future__ import annotations
 from jobsearcher.exporters.base import Exporter, ExporterError, ExportResult
 from jobsearcher.exporters.files import CsvExporter, JsonExporter, MarkdownExporter
 
-# Format name -> always-importable exporter class. ``notion`` is handled
-# separately in get_exporter because importing it needs the ``notion`` extra.
+# Format name -> offline exporter class. ``notion`` is handled separately in
+# get_exporter, which imports it only when it is the format asked for.
 _BUILTIN_EXPORTERS: dict[str, type[Exporter]] = {
     "csv": CsvExporter,
     "json": JsonExporter,
@@ -41,8 +41,6 @@ def get_exporter(fmt: str) -> Exporter:
 
     Raises:
         ExporterConfigError: If ``fmt`` is not a known format.
-        ModuleNotFoundError: If ``fmt`` is ``notion`` but the ``notion``
-            extra is not installed (the message says how to fix it).
     """
     builtin = _BUILTIN_EXPORTERS.get(fmt)
     if builtin is not None:

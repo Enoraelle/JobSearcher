@@ -1,4 +1,4 @@
-"""Optional Notion exporter, gated behind the ``notion`` extra.
+"""Optional Notion exporter.
 
 This exporter keeps one Notion database page per posting. Re-running it does
 **not** create duplicates: each posting is matched to its existing page by
@@ -14,9 +14,9 @@ zero API keys" rule:
   ``NOTION_API_KEY``). It is never read from ``config.yaml``, which is
   version-controlled — putting an ``api_key`` there is a configuration
   error, not a fallback.
-- **Friendly missing-dependency error.** Importing this module without the
-  ``notion`` extra raises with "install jobsearcher[notion] to use this
-  exporter", not a bare ``ImportError``.
+- **Nothing to install.** It speaks plain HTTP to the Notion REST API with
+  the ``httpx`` the rest of the package already uses, so enabling it is a
+  config block and an integration token, not a second install.
 
 Because this is the module most likely to break in a user's setup — wrong
 database id, integration not shared, a property named differently or missing
@@ -26,20 +26,34 @@ schema is checked up front: before a single page is written, every property
 JobSearcher intends to fill is verified to exist with the right type, and if
 any is wrong the error lists each one with the Notion property type to
 create.
+
+Two consequences of syncing one page at a time shape the rest of this
+module:
+
+- **Requests are paced.** Each posting costs two requests (a lookup and a
+  create-or-update), and Notion allows roughly three requests per second.
+  Left unpaced, a run of a few dozen postings earns a 429 on its own. The
+  ``requests_per_second`` option (default ``2.5``, just under Notion's
+  advertised ceiling, ``0`` to disable) spaces every request out; the
+  limiter is the same one :mod:`jobsearcher.sources.base` applies to
+  scraping.
+- **An interrupted run reports its progress.** A failure on posting 40 of 75
+  still leaves 39 pages in Notion. Re-running is the right fix — the upsert
+  is keyed on the posting URL, so nothing is duplicated — but only if the
+  user is told where it stopped, so the error raised from inside the write
+  loop carries how many pages were created and updated before it.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
-try:  # The ``notion`` extra. Keep this the only place its deps enter.
-    import httpx
-    from pydantic import BaseModel, ConfigDict, Field, ValidationError
-except ModuleNotFoundError as exc:  # pragma: no cover - httpx ships with the base package today
-    raise ModuleNotFoundError("install jobsearcher[notion] to use this exporter") from exc
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jobsearcher.config import PluginConfig
 from jobsearcher.exporters.base import ExporterError, ExportResult
@@ -49,6 +63,12 @@ _API_ROOT: Final = "https://api.notion.com/v1"
 _DEFAULT_KEY_ENV: Final = "NOTION_API_KEY"
 _DEFAULT_NOTION_VERSION: Final = "2022-06-28"
 _DEFAULT_TIMEOUT: Final = 30.0
+
+# Notion documents an average of three requests per second per integration.
+# The default sits deliberately under it: pacing exactly to an advertised
+# average earns occasional 429s as soon as latency varies, and the margin
+# costs seconds on an export of a hundred postings.
+_DEFAULT_REQUESTS_PER_SECOND: Final = 2.5
 
 
 @dataclass(frozen=True)
@@ -96,6 +116,8 @@ class NotionExporterConfig(BaseModel):
     api_key_env: str = _DEFAULT_KEY_ENV
     notion_version: str = _DEFAULT_NOTION_VERSION
     timeout: float = Field(default=_DEFAULT_TIMEOUT, gt=0.0)
+    requests_per_second: float = Field(default=_DEFAULT_REQUESTS_PER_SECOND, ge=0.0)
+    """How fast to send requests, in requests per second. ``0`` disables pacing."""
 
     title_property: str = "Name"
     url_property: str = "URL"
@@ -142,11 +164,16 @@ class NotionExporter:
 
             created = 0
             updated = 0
-            for posting in postings:
-                if session.upsert_page(posting):
-                    created += 1
-                else:
-                    updated += 1
+            for index, posting in enumerate(postings):
+                try:
+                    if session.upsert_page(posting):
+                        created += 1
+                    else:
+                        updated += 1
+                except ExporterError as exc:
+                    raise ExporterError(
+                        _interrupted_message(exc, index, len(postings), created, updated)
+                    ) from exc
         finally:
             if owns_client:
                 client.close()
@@ -204,6 +231,29 @@ def _resolve_token(config: NotionExporterConfig) -> str:
     return token
 
 
+def _interrupted_message(
+    cause: ExporterError, index: int, total: int, created: int, updated: int
+) -> str:
+    """Restate a mid-loop failure with the progress it would otherwise hide.
+
+    Args:
+        cause: The failure raised while syncing one posting.
+        index: Zero-based position of the posting that failed.
+        total: How many postings the export was asked to sync.
+        created: Pages created before the failure.
+        updated: Pages updated before the failure.
+
+    Returns:
+        The original message, followed by where the export stopped and what
+        is already in Notion.
+    """
+    return (
+        f"{cause}\n\nStopped on posting {index + 1} of {total}: {created} created, "
+        f"{updated} updated before the failure. Those pages are matched by URL, so "
+        "running the export again updates them rather than duplicating them."
+    )
+
+
 # --------------------------------------------------------------------------
 # One export run against the Notion API
 # --------------------------------------------------------------------------
@@ -220,6 +270,9 @@ class _Session:
             "Notion-Version": config.notion_version,
             "Content-Type": "application/json",
         }
+        rate = config.requests_per_second
+        self._min_request_interval = 1.0 / rate if rate > 0 else 0.0
+        self._last_request_at: float | None = None
 
     def check_database_schema(self) -> None:
         """Fail early unless every property JobSearcher writes exists and fits.
@@ -328,7 +381,23 @@ class _Session:
         context: str,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Perform one Notion API call under the configured rate limit.
+
+        Args:
+            method: The HTTP method.
+            path: The path below ``/v1``.
+            context: What the call was for, quoted in any error message.
+            json: The request body, if any.
+
+        Returns:
+            The decoded response body.
+
+        Raises:
+            ExporterError: If the call could not be made or Notion refused
+                it. The message names what to fix.
+        """
         url = f"{_API_ROOT}{path}"
+        self._respect_rate_limit()
         try:
             response = self._client.request(method, url, headers=self._headers, json=json)
         except httpx.HTTPError as exc:
@@ -339,6 +408,14 @@ class _Session:
             return body
 
         raise self._translate_error(response, context)
+
+    def _respect_rate_limit(self) -> None:
+        """Sleep if needed so requests stay `requests_per_second` apart."""
+        if self._min_request_interval > 0 and self._last_request_at is not None:
+            remaining = self._min_request_interval - (time.monotonic() - self._last_request_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_request_at = time.monotonic()
 
     def _translate_error(self, response: httpx.Response, context: str) -> ExporterError:
         try:

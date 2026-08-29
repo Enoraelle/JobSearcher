@@ -23,9 +23,10 @@ search:
 
   # NOT a collection filter. Nothing is dropped while fetching: every
   # posting is tagged with a best-effort detected language (fr/en/de/es, or
-  # blank when undetermined) and this list is only the default filter
-  # `jobsearcher list` applies at display time. Override it per run with
-  # `--language <code>` or see everything with `--language all`; postings
+  # blank when undetermined) and this list is only the default scope of the
+  # commands that read them back — `list`, `export` and `run` all apply it,
+  # so what you see listed is what gets exported. Override it per run with
+  # `--language <code>` or take everything with `--language all`; postings
   # whose language could not be determined are never hidden.
   languages:
     - en
@@ -112,14 +113,20 @@ scoring:
   absent_skill_penalty: 0.34
   absent_skill_penalty_cap: 1.0
 
-  # Bonus, opt-in, requires `pip install "jobsearcher[llm]"` and an API key
-  # in the environment (never in this file). Talks to any OpenAI-compatible
+  # Bonus, opt-in. Nothing to install: it needs only an API key in the
+  # environment (never in this file). Talks to any OpenAI-compatible
   # endpoint. Replace the block above with this one to use it.
   # backend: llm
   # base_url: "https://api.openai.com/v1"
   # model: "gpt-4o-mini"
   # api_key_env: "OPENAI_API_KEY"
-  # max_postings_per_run: 25
+  # Hard cap on API calls per run, retries included: a posting whose first
+  # reply is unusable is retried once and costs two of them.
+  # max_requests_per_run: 25
+  # How much of a posting description to send per call. The cap above bounds
+  # how many calls go out; this one bounds what each call costs. 0 sends the
+  # whole description.
+  # max_description_chars: 4000
 
 exporters:
   # Offline file formats, standard library only. Each needs an
@@ -137,17 +144,23 @@ exporters:
     enabled: false
     output_path: "./jobs.json"
 
-  # Bonus, opt-in, requires `pip install "jobsearcher[notion]"`. Keeps one
-  # database page per posting, matched by URL so re-exporting updates rather
-  # than duplicates; the application status goes to a select property. The
-  # integration token is read only from the environment variable named by
-  # `api_key_env` (never from this file). The database must already have the
-  # properties below (types in parentheses); a missing or mistyped one is
-  # reported with the exact property to create.
+  # Bonus, opt-in. Nothing to install. Keeps one database page per posting,
+  # matched by URL so re-exporting updates rather than duplicates; the
+  # application status goes to a select property. The integration token is
+  # read only from the environment variable named by `api_key_env` (never
+  # from this file). The database must already have the properties below
+  # (types in parentheses); a missing or mistyped one is reported with the
+  # exact property to create.
   notion:
     enabled: false
     database_id: "your-notion-database-id"
     api_key_env: "NOTION_API_KEY"
+    # Each posting costs two requests (a lookup, then a create or update)
+    # and Notion allows about three requests per second, so the export
+    # paces itself. The default stays under that ceiling on purpose, since
+    # pacing exactly to it earns 429s whenever latency varies. Lower it if
+    # you still hit one; 0 disables pacing.
+    requests_per_second: 2.5
     # Property names, if yours differ from these defaults:
     # title_property: "Name"       # (title)
     # url_property: "URL"          # (url)   — the idempotency key

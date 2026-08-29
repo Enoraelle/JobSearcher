@@ -9,6 +9,7 @@ idempotent re-export.
 from __future__ import annotations
 
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,6 +28,18 @@ _DB_ID = "db-1234567890"
 @pytest.fixture(autouse=True)
 def _clear_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(_KEY_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the exporter's rate-limit pauses instead of serving them.
+
+    Autouse so no test in this module pays real wall-clock time for the
+    limiter; the rate-limiting tests read the recorded delays back.
+    """
+    delays: list[float] = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    return delays
 
 
 def _with_key(monkeypatch: pytest.MonkeyPatch, value: str = "secret_token") -> None:
@@ -372,3 +385,106 @@ def test_owned_client_is_created_and_closed(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert len(created) == 1
     assert created[0].closed is True
+
+
+# --------------------------------------------------------------------------
+# Rate limiting and interrupted exports
+# --------------------------------------------------------------------------
+
+
+def test_requests_are_spaced_out_by_default(
+    monkeypatch: pytest.MonkeyPatch, slept: list[float]
+) -> None:
+    """Notion allows ~3 requests/second, and one export makes two per posting."""
+    _with_key(monkeypatch)
+    notion = _FakeNotion()
+    postings = [
+        _posting(url="https://example.com/jobs/1"),
+        _posting(url="https://example.com/jobs/2"),
+    ]
+
+    NotionExporter(client=notion).export(postings, _opts())
+
+    # One schema read, then a lookup and a write per posting.
+    assert len(notion.requests) == 5
+    # Every request but the first waits out the interval before going out,
+    # at a default rate deliberately below Notion's advertised 3/s.
+    assert len(slept) == 4
+    assert all(delay == pytest.approx(1 / 2.5, abs=0.05) for delay in slept)
+
+
+def test_rate_limit_is_configurable(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
+    _with_key(monkeypatch)
+
+    NotionExporter(client=_FakeNotion()).export([_posting()], _opts(requests_per_second=10))
+
+    assert slept
+    assert all(delay == pytest.approx(0.1, abs=0.05) for delay in slept)
+
+
+def test_rate_limit_can_be_turned_off(monkeypatch: pytest.MonkeyPatch, slept: list[float]) -> None:
+    _with_key(monkeypatch)
+
+    NotionExporter(client=_FakeNotion()).export([_posting()], _opts(requests_per_second=0))
+
+    assert slept == []
+
+
+def test_interrupted_export_says_how_much_it_wrote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure mid-loop must not swallow the pages already written."""
+    _with_key(monkeypatch)
+
+    class _RateLimitAfterTwo(_FakeNotion):
+        def _handle_create(self, body: dict[str, Any]) -> _FakeResponse:
+            if len(self.pages) >= 2:
+                return _FakeResponse(429, _notion_error(429, "rate_limited", "Slow down."))
+            return super()._handle_create(body)
+
+    postings = [_posting(url=f"https://example.com/jobs/{n}") for n in range(1, 5)]
+
+    with pytest.raises(ExporterError) as excinfo:
+        NotionExporter(client=_RateLimitAfterTwo()).export(postings, _opts())
+
+    message = str(excinfo.value)
+    # The reason it stopped survives...
+    assert "rate-limit" in message
+    # ...alongside where it stopped and what is already in Notion.
+    assert "3 of 4" in message
+    assert "2 created" in message
+    assert "0 updated" in message
+
+
+def test_interrupted_reexport_counts_updates_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_key(monkeypatch)
+
+    class _FailOnThirdLookup(_FakeNotion):
+        def _handle_query(self, body: dict[str, Any]) -> _FakeResponse:
+            self.lookups = getattr(self, "lookups", 0) + 1
+            if self.lookups > 2:
+                return _FakeResponse(500, _notion_error(500, "internal_server_error", "Boom."))
+            return super()._handle_query(body)
+
+    notion = _FailOnThirdLookup()
+    postings = [_posting(url=f"https://example.com/jobs/{n}") for n in range(1, 4)]
+    NotionExporter(client=notion).export(postings[:2], _opts())
+    notion.lookups = 0
+
+    with pytest.raises(ExporterError) as excinfo:
+        NotionExporter(client=notion).export(postings, _opts())
+
+    message = str(excinfo.value)
+    assert "3 of 3" in message
+    assert "0 created" in message
+    assert "2 updated" in message
+
+
+def test_a_schema_failure_reports_no_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The counts belong to the write loop; nothing has been written before it."""
+    _with_key(monkeypatch)
+    schema = _full_schema()
+    del schema["Score"]
+
+    with pytest.raises(ExporterError) as excinfo:
+        NotionExporter(client=_FakeNotion(schema=schema)).export([_posting()], _opts())
+
+    assert "created" not in str(excinfo.value)

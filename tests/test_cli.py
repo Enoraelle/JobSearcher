@@ -66,6 +66,41 @@ def _fake_source(*titles: str, **extra: Any) -> dict[str, Any]:
     return {"fake": {"enabled": True, "postings": postings, **extra}}
 
 
+# Long enough, and French enough, for language.detect_language to call it `fr`.
+_FRENCH_DESCRIPTION = (
+    "Nous recherchons un developpeur backend pour rejoindre notre equipe, "
+    "avec des projets de refonte de la plateforme que nous menons pour "
+    "les clients qui nous font confiance."
+)
+
+
+def _two_languages() -> dict[str, Any]:
+    """One posting whose language is undetermined, one detected as French."""
+    return {
+        "fake": {
+            "enabled": True,
+            "postings": [
+                {"url": "https://jobs.test/en", "title": "Backend Engineer"},
+                {
+                    "url": "https://jobs.test/fr",
+                    "title": "Developpeur Backend",
+                    "description": _FRENCH_DESCRIPTION,
+                },
+            ],
+        }
+    }
+
+
+def _json_exporter() -> dict[str, Any]:
+    return {"json": {"enabled": True, "output_path": "./out.json"}}
+
+
+def _exported_urls(path: str = "out.json") -> list[str]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    urls: list[str] = [posting["url"] for posting in payload["postings"]]
+    return urls
+
+
 @pytest.fixture
 def runner() -> Iterator[CliRunner]:
     cli_runner = CliRunner()
@@ -509,3 +544,100 @@ def test_run_still_succeeds_despite_an_unreadable_row(runner: CliRunner) -> None
 
     assert result.exit_code == 0
     assert "wrote 1 postings" in result.output
+
+
+# --------------------------------------------------------------------------
+# list and export cover the same postings
+# --------------------------------------------------------------------------
+
+
+def test_export_defaults_to_the_same_language_scope_as_list(runner: CliRunner) -> None:
+    """Listing 1 posting and then exporting 2 makes the shown list a lie."""
+    _write_config(sources=_two_languages(), exporters=_json_exporter())
+    _invoke(runner, "fetch")
+
+    listed = json.loads(_invoke(runner, "list", "--json").output)
+    result = _invoke(runner, "export", "json")
+
+    assert result.exit_code == 0
+    assert [posting["url"] for posting in listed] == ["https://jobs.test/en"]
+    assert _exported_urls() == ["https://jobs.test/en"]
+
+
+def test_export_language_all_widens_the_scope_like_list(runner: CliRunner) -> None:
+    _write_config(sources=_two_languages(), exporters=_json_exporter())
+    _invoke(runner, "fetch")
+
+    listed = json.loads(_invoke(runner, "list", "--language", "all", "--json").output)
+    _invoke(runner, "export", "json", "--language", "all")
+
+    assert len(listed) == 2
+    assert sorted(_exported_urls()) == ["https://jobs.test/en", "https://jobs.test/fr"]
+
+
+def test_export_takes_an_explicit_language(runner: CliRunner) -> None:
+    _write_config(sources=_two_languages(), exporters=_json_exporter())
+    _invoke(runner, "fetch")
+
+    _invoke(runner, "export", "json", "--language", "fr")
+
+    # The undetermined posting is never hidden by a language filter.
+    assert sorted(_exported_urls()) == ["https://jobs.test/en", "https://jobs.test/fr"]
+
+
+def test_export_unscored_filter(runner: CliRunner) -> None:
+    _write_config(
+        sources=_fake_source("Backend Engineer", "Frontend Engineer"),
+        exporters=_json_exporter(),
+    )
+    _invoke(runner, "fetch")
+    _invoke(runner, "score", "--limit", "1")
+
+    result = _invoke(runner, "export", "json", "--unscored")
+
+    assert result.exit_code == 0
+    assert len(_exported_urls()) == 1
+
+
+def test_export_unscored_rejects_score_bounds(runner: CliRunner) -> None:
+    _write_config(sources=_fake_source("Backend Engineer"), exporters=_json_exporter())
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "export", "json", "--unscored", "--min-score", "10")
+
+    assert result.exit_code == 2
+    assert "--unscored cannot be combined" in result.output
+
+
+def test_run_exports_the_same_scope_as_list(runner: CliRunner) -> None:
+    _write_config(sources=_two_languages(), exporters=_json_exporter())
+
+    _invoke(runner, "run")
+
+    assert _exported_urls() == ["https://jobs.test/en"]
+
+
+def test_run_language_all_widens_its_export(runner: CliRunner) -> None:
+    _write_config(sources=_two_languages(), exporters=_json_exporter())
+
+    _invoke(runner, "run", "--language", "all")
+
+    assert sorted(_exported_urls()) == ["https://jobs.test/en", "https://jobs.test/fr"]
+
+
+def test_score_explains_the_renamed_llm_budget_key(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.yaml carrying the old key must say what to change, and why."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    _write_config(
+        sources=_fake_source("Backend Engineer"),
+        scoring={"backend": "llm", "max_postings_per_run": 25},
+    )
+    _invoke(runner, "fetch")
+
+    result = _invoke(runner, "score")
+
+    assert result.exit_code == 1
+    assert "max_requests_per_run" in result.output
+    assert "Extra inputs are not permitted" not in result.output
