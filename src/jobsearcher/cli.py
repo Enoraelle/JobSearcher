@@ -247,8 +247,13 @@ def fetch(ctx: AppContext, sources: tuple[str, ...], limit: int | None) -> None:
                 )
 
     _render_fetch_table(results, dry_run=ctx.dry_run)
-    if results and all(result.failed for result in results):
-        raise click.ClickException("every selected source failed; see the errors above")
+    if any(result.failed for result in results):
+        # Same rule as `run` (see `RunReport.ok`): one dead source fails the
+        # command. `fetch` is just as likely to be the thing a cron job
+        # calls, and an exit code that only turns non-zero once *every*
+        # source is down is an exit code that ignores a source which has
+        # been broken for three weeks.
+        raise click.ClickException("one or more sources failed; see the errors above")
 
 
 # --------------------------------------------------------------------------

@@ -142,6 +142,17 @@ class JobPosting(BaseModel):
     source: str
 
     # --- Content ---
+    # `description_raw` is the posting body exactly as its source delivers
+    # it, and what that *is* differs by source: HTML markup from Greenhouse
+    # (unescaped once, see `_description_html`) and from We Work Remotely,
+    # plain text from free-work.com, whose search cards carry no markup.
+    # Nothing normalizes it, on purpose — it is the field to look at when a
+    # source starts emitting something unexpected, so it must stay
+    # untouched. A consumer that wants text must therefore read
+    # `description_clean`, which every source fills with plain text (and
+    # which is `None` only when there was no body at all); treating
+    # `description_raw` as text is how `<p>` and `<li>` end up counted as
+    # words by a scorer or shown to a reader in an export.
     description_raw: str
     description_clean: str | None = None
 

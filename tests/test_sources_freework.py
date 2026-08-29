@@ -197,3 +197,87 @@ def test_missing_keywords_is_rejected_at_construction() -> None:
 
     with pytest.raises(SourceConfigError):
         FreeworkSource("freework", config, client=client)
+
+
+def test_http_policy_options_are_part_of_the_source_configuration() -> None:
+    source = FreeworkSource(
+        "freework",
+        PluginConfig(
+            keywords=["python django"],
+            min_request_interval=0.5,
+            max_retries=1,
+            backoff_base=0.01,
+            timeout=2.5,
+        ),
+    )
+    with source:
+        assert source._min_request_interval == 0.5
+
+
+# --------------------------------------------------------------------------
+# Work mode inference (shared with the other sources)
+# --------------------------------------------------------------------------
+
+
+def test_a_negated_remote_mention_is_not_a_remote_posting() -> None:
+    """ "This role is not remote" must not land the posting under `--remote`.
+
+    The Greenhouse source has read negations correctly for a while. Two
+    copies of one heuristic is how one of them keeps being wrong.
+    """
+    source = _source(_search_handler)
+
+    posting = source.normalize(
+        {
+            "title": "Développeur Backend",
+            "url": "https://www.free-work.com/fr/tech-it/mission/backend",
+            "location": "Paris",
+            "contract_type": "This role is not remote",
+        }
+    )
+
+    assert posting.work_mode is WorkMode.ONSITE
+
+
+def test_a_french_negated_remote_mention_is_not_a_remote_posting() -> None:
+    source = _source(_search_handler)
+
+    posting = source.normalize(
+        {
+            "title": "Développeur Backend",
+            "url": "https://www.free-work.com/fr/tech-it/mission/backend-2",
+            "location": "Paris",
+            "contract_type": "Pas de télétravail",
+        }
+    )
+
+    assert posting.work_mode is WorkMode.ONSITE
+
+
+def test_remote_is_still_detected_when_it_is_actually_offered() -> None:
+    source = _source(_search_handler)
+
+    posting = source.normalize(
+        {
+            "title": "Développeur Backend",
+            "url": "https://www.free-work.com/fr/tech-it/mission/backend-3",
+            "location": "Télétravail total",
+        }
+    )
+
+    assert posting.work_mode is WorkMode.REMOTE
+
+
+def test_a_remote_marker_inside_a_longer_word_does_not_count() -> None:
+    source = _source(_search_handler)
+
+    posting = source.normalize(
+        {
+            "title": "Développeur Backend",
+            "url": "https://www.free-work.com/fr/tech-it/mission/backend-4",
+            "location": "Remotely-Managed Ltd offices, Lyon",
+            "contract_type": "CDI",
+        }
+    )
+
+    assert posting.work_mode is WorkMode.ONSITE

@@ -69,7 +69,7 @@ from types import TracebackType
 from typing import Any, Final, TypeVar
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jobsearcher import __version__
 from jobsearcher.config import PluginConfig
@@ -92,6 +92,55 @@ USER_AGENT: Final[str] = f"JobSearcher/{__version__} (+{PROJECT_URL})"
 # Retried with backoff by `_request`: rate limiting and server-side errors.
 # Anything else non-2xx (401, 403, 404, ...) is treated as a config problem.
 _RETRYABLE_STATUS_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+
+
+class SourceHttpConfig(BaseModel):
+    """The HTTP-policy options every source accepts, whatever else it reads.
+
+    `Source` applies the same timeout, retry, backoff and rate-limiting
+    policy to every source, and each of those is a number the user has a
+    legitimate reason to change: a slow board needs a longer timeout, and a
+    site that dislikes bursts needs `min_request_interval` — which is the
+    only thing standing between We Work Remotely's opt-in
+    `fetch_full_description` fan-out and one request per posting at full
+    speed against someone else's server.
+
+    They live here, on a base model each source's own config inherits,
+    rather than being repeated per source: a source that forgot to declare
+    them would reject them as unknown keys (every source config forbids
+    extras), so the advice to set them would name an option that does not
+    exist. Inheriting also means each source keeps one complete schema of
+    everything it accepts, which is what its `extra="forbid"` is validated
+    against.
+
+    Attributes:
+        enabled: Whether the pipeline runs this source at all.
+        timeout: Seconds before a single HTTP request gives up.
+        max_retries: Retry attempts for one request, on top of the first.
+        backoff_base: Base seconds for exponential backoff between retries.
+        min_request_interval: Minimum seconds between two requests from
+            this source. ``0`` (the default) disables rate limiting.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    timeout: float = Field(default=DEFAULT_TIMEOUT, gt=0.0)
+    max_retries: int = Field(default=DEFAULT_MAX_RETRIES, ge=0)
+    backoff_base: float = Field(default=DEFAULT_BACKOFF_BASE, ge=0.0)
+    min_request_interval: float = Field(default=0.0, ge=0.0)
+
+
+class _HttpPolicyOnly(SourceHttpConfig):
+    """The same options, read out of a block that also carries other keys.
+
+    ``extra="ignore"``: the caller (the pipeline) has the whole source
+    block, source-specific keys included, and only needs the shared part.
+    Those other keys are still checked — by the source itself, against its
+    own strict schema, a moment later.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class SourceError(Exception):
@@ -202,6 +251,32 @@ def registered_source_names() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def read_http_policy(name: str, config: PluginConfig) -> SourceHttpConfig:
+    """Read the shared HTTP-policy options out of one source's config block.
+
+    Args:
+        name: The source's configured name, for the error message.
+        config: That source's raw configuration block, source-specific keys
+            included.
+
+    Returns:
+        The policy, filled with the shared defaults for whatever the block
+        does not set.
+
+    Raises:
+        SourceConfigError: If one of the options holds an unusable value
+            (a negative interval, a zero timeout).
+    """
+    try:
+        return _HttpPolicyOnly.model_validate(config.model_dump())
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"`{'.'.join(str(part) for part in error['loc'])}`: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise SourceConfigError(f"Invalid HTTP options for source {name!r}: {problems}") from exc
+
+
 class Source(ABC):
     """Base class for one job source.
 
@@ -222,38 +297,58 @@ class Source(ABC):
         config: PluginConfig,
         *,
         client: httpx.Client | None = None,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        backoff_base: float = DEFAULT_BACKOFF_BASE,
-        min_request_interval: float = 0.0,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+        backoff_base: float | None = None,
+        min_request_interval: float | None = None,
     ) -> None:
         """Initialize the source.
+
+        The HTTP policy comes from `config` (see `SourceHttpConfig`), the
+        same way the Notion exporter reads its own `requests_per_second`: a
+        policy only a caller could supply would be unreachable from
+        config.yaml, which is where the person being rate-limited by a site
+        actually works. The keyword arguments below override it — `None`
+        means "whatever the config block says" — and exist for tests, which
+        need a backoff measured in milliseconds rather than seconds.
 
         Args:
             name: The source's registered name, used as `JobPosting.source`
                 and in log messages.
             config: This source's configuration block.
             client: An `httpx.Client` to use for requests. If omitted, one is
-                created (with the shared timeout and User-Agent) and closed
-                by this instance's `close()`. Pass one in for testing.
+                created (with the resolved timeout and the shared
+                User-Agent) and closed by this instance's `close()`. Pass one
+                in for testing; a client passed in brings its own timeout.
+            timeout: Seconds before a single request gives up.
             max_retries: Maximum retry attempts for a single `_request` call,
                 on top of the first attempt.
             backoff_base: Base seconds for exponential backoff between
                 retries (`backoff_base * 2**attempt`).
             min_request_interval: Minimum seconds to leave between requests
-                made through `_request`, for rate limiting. `0` (default)
-                disables rate limiting.
+                made through `_request`, for rate limiting. `0` disables
+                rate limiting.
+
+        Raises:
+            SourceConfigError: If the config block holds an unusable value
+                for one of the shared HTTP options.
         """
         self.name = name
         self.config = config
         self.last_run: SourceRunStats = SourceRunStats()
 
+        policy = read_http_policy(name, config)
+        self._max_retries = policy.max_retries if max_retries is None else max_retries
+        self._backoff_base = policy.backoff_base if backoff_base is None else backoff_base
+        self._min_request_interval = (
+            policy.min_request_interval if min_request_interval is None else min_request_interval
+        )
+
         self._owns_client = client is None
         self._client = client or httpx.Client(
-            timeout=DEFAULT_TIMEOUT, headers={"User-Agent": USER_AGENT}
+            timeout=policy.timeout if timeout is None else timeout,
+            headers={"User-Agent": USER_AGENT},
         )
-        self._max_retries = max_retries
-        self._backoff_base = backoff_base
-        self._min_request_interval = min_request_interval
         self._last_request_at: float | None = None
 
     def close(self) -> None:

@@ -25,10 +25,11 @@ it is expected to degrade rather than fail: if the detail page is
 unreachable or its markup doesn't match `_DETAIL_DESCRIPTION_CONTAINER_CLASS`
 anymore, `_fetch_full_description` logs a warning and returns `None`, and
 `normalize` simply keeps the truncated RSS description instead of raising.
-Callers enabling `fetch_full_description` should also pass a non-zero
-`min_request_interval` to `__init__` (see `Source.__init__`), since that is
-what rate-limits the resulting one-request-per-posting fan-out; this source
-does not add a second, separate rate limiter on top of it.
+Anyone enabling `fetch_full_description` should also set a non-zero
+`min_request_interval` in the same `sources.weworkremotely` block — one of
+the shared options in `SourceHttpConfig`, which the pipeline passes on —
+since that is what paces the resulting one-request-per-posting fan-out;
+this source does not add a second, separate rate limiter on top of it.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import Field, ValidationError
 
 from jobsearcher.config import PluginConfig
 from jobsearcher.models import JobPosting, WorkMode
@@ -50,6 +51,7 @@ from jobsearcher.sources.base import (
     Source,
     SourceConfigError,
     SourceError,
+    SourceHttpConfig,
     SourceUnavailableError,
     register_source,
 )
@@ -74,18 +76,19 @@ _UNRESTRICTED_REGION_MARKERS: Final[frozenset[str]] = frozenset(
 _DETAIL_DESCRIPTION_CONTAINER_CLASS: Final[str] = "listing-container"
 
 
-class WeWorkRemotelySourceConfig(BaseModel):
+class WeWorkRemotelySourceConfig(SourceHttpConfig):
     """Typed, validated configuration for `WeWorkRemotelySource`.
 
     Re-validated from the permissive `PluginConfig` once we know we're
     dealing with We Work Remotely specifically, the same way
     `GreenhouseSourceConfig` is — see that class's docstring for why
     `extra="forbid"` matters here.
+
+    `min_request_interval`, the option this source's docstring tells you to
+    set alongside `fetch_full_description`, is one of the shared HTTP-policy
+    options inherited from `SourceHttpConfig`.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
     feeds: list[str] = Field(default_factory=lambda: [_MAIN_FEED_NAME], min_length=1)
     fetch_full_description: bool = False
     max_postings_per_feed: int | None = Field(default=None, ge=1)
@@ -208,12 +211,27 @@ def _split_company_and_title(title: str) -> tuple[str, str] | None:
 
 
 def _parse_rfc822(value: str | None) -> datetime | None:
-    """Parse an RSS `pubDate` (RFC 822) into a UTC-aware datetime."""
+    """Parse an RSS `pubDate` (RFC 822) into a UTC-aware datetime.
+
+    Args:
+        value: The item's `pubDate`, or `None` if it carries none.
+
+    Returns:
+        The timestamp in UTC, or `None` if there is none to read, or `None`
+        with a logged warning if there was one and it could not be read —
+        a posting silently losing its date leaves nothing to investigate
+        with the day the feed changes format.
+    """
     if not value:
         return None
     try:
         parsed = parsedate_to_datetime(value)
     except (TypeError, ValueError):
+        logger.warning(
+            "We Work Remotely: could not parse the pubDate %r; the posting is kept "
+            "without a published date.",
+            value,
+        )
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
@@ -247,9 +265,11 @@ class WeWorkRemotelySource(Source):
             config: This source's configuration block; re-validated into
                 `WeWorkRemotelySourceConfig`.
             **kwargs: Passed through to `Source.__init__` (`client`,
-                `max_retries`, `backoff_base`, `min_request_interval`). Pass
-                a non-zero `min_request_interval` when enabling
-                `fetch_full_description` (see the module docstring).
+                `timeout`, `max_retries`, `backoff_base`,
+                `min_request_interval`); the pipeline fills these from the
+                same config block. Set a non-zero `min_request_interval`
+                when enabling `fetch_full_description` (see the module
+                docstring).
 
         Raises:
             SourceConfigError: If `config` doesn't validate as

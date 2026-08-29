@@ -9,15 +9,26 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from jobsearcher.config import AppConfig
 from jobsearcher.models import JobPosting
 from jobsearcher.pipeline import Pipeline, PipelineError, PostingFilters
-from jobsearcher.scoring import KeywordScorer, ScorerBudgetExhaustedError
-from jobsearcher.sources.base import _REGISTRY, Source, register_source
+from jobsearcher.scoring import (
+    KeywordScorer,
+    ScorerBudgetExhaustedError,
+    ScoringError,
+)
+from jobsearcher.sources.base import (
+    _REGISTRY,
+    DEFAULT_BACKOFF_BASE,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT,
+    Source,
+    register_source,
+)
 from jobsearcher.storage.sqlite import SqliteStorage
 
 # The network-free "fake" source is registered by tests/conftest.py.
@@ -459,7 +470,7 @@ def test_run_is_not_ok_when_every_posting_fails_to_score(
     )
 
     def _boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("scorer is down")
+        raise ScoringError("scorer is down")
 
     monkeypatch.setattr(KeywordScorer, "score", _boom)
     report = Pipeline(config, storage).run()
@@ -661,3 +672,161 @@ def test_unreadable_rows_do_not_by_themselves_make_a_run_fail(
 
     assert report.ok is True
     assert any(outcome.unreadable for outcome in report.export)
+
+
+# -- the scorer exception contract ---------------------------------------
+
+
+def test_score_reports_a_missing_api_key_as_a_pipeline_error(
+    storage: SqliteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The most expected LLM failure must not reach the caller as a traceback.
+
+    The pipeline promises `PipelineError` when the backend cannot be built.
+    An `except` clause that happens to cover the errors one scorer raises
+    breaks as soon as another scorer raises something else, so the contract
+    is what is asserted here, not the concrete class.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = _make_config(scoring={"backend": "llm"})
+
+    with pytest.raises(PipelineError, match="OPENAI_API_KEY"):
+        list(Pipeline(config, storage).score())
+
+
+def test_score_reports_an_unknown_backend_as_a_pipeline_error(storage: SqliteStorage) -> None:
+    config = _make_config(scoring={"backend": "nope"})
+
+    with pytest.raises(PipelineError, match="nope"):
+        list(Pipeline(config, storage).score())
+
+
+def test_score_reports_an_invalid_backend_option_as_a_pipeline_error(
+    storage: SqliteStorage,
+) -> None:
+    config = _make_config(scoring={"backend": "keyword_match", "synonynms": []})
+
+    with pytest.raises(PipelineError, match="synonynms"):
+        list(Pipeline(config, storage).score())
+
+
+def test_a_scoring_error_leaves_the_posting_unscored_and_the_phase_running(
+    storage: SqliteStorage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scorer failing on one posting is a per-posting failure, not a crash."""
+    config = _make_config(
+        sources={
+            "fake": {
+                "enabled": True,
+                "postings": [
+                    _posting("https://jobs.test/1", "Backend Engineer"),
+                    _posting("https://jobs.test/2", "Django Developer"),
+                ],
+            }
+        }
+    )
+    pipeline = Pipeline(config, storage)
+    list(pipeline.fetch())
+
+    calls = {"n": 0}
+    real_score = KeywordScorer.score
+
+    def _flaky(self: KeywordScorer, posting: Any, profile: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ScoringError("the model refused this posting")
+        return real_score(self, posting, profile)
+
+    monkeypatch.setattr(KeywordScorer, "score", _flaky)
+    rows = list(pipeline.score())
+
+    assert [row.result is None for row in rows] == [True, False]
+    assert rows[0].reason == "the model refused this posting"
+    assert storage.count(scored=False) == 1
+
+
+# -- the shared HTTP policy is configuration, not a constructor secret ----
+
+
+class _ProbeSource(Source):
+    """Records the instances the pipeline builds, and fetches nothing."""
+
+    built: ClassVar[list[_ProbeSource]] = []
+
+    def __init__(self, name: str, config: Any, **kwargs: Any) -> None:
+        super().__init__(name, config, **kwargs)
+        type(self).built.append(self)
+
+    def fetch_raw(self) -> Iterator[dict[str, Any]]:
+        return iter(())
+
+    def normalize(self, raw: dict[str, Any]) -> JobPosting:  # pragma: no cover - never reached
+        raise AssertionError("the probe source yields no item")
+
+
+@pytest.fixture
+def probe_source() -> Iterator[list[_ProbeSource]]:
+    _ProbeSource.built = []
+    register_source("probe")(_ProbeSource)
+    try:
+        yield _ProbeSource.built
+    finally:
+        _REGISTRY.pop("probe", None)
+
+
+def test_fetch_passes_the_configured_http_policy_to_the_source(
+    storage: SqliteStorage, probe_source: list[_ProbeSource]
+) -> None:
+    """Rate limiting is unreachable if the pipeline never passes it on.
+
+    The We Work Remotely source tells callers to set `min_request_interval`
+    before enabling its one-request-per-posting fan-out. That advice is only
+    real if the value can travel from config.yaml to the source.
+    """
+    config = _make_config(
+        sources={
+            "probe": {
+                "enabled": True,
+                "min_request_interval": 1.5,
+                "max_retries": 7,
+                "backoff_base": 0.25,
+                "timeout": 3.5,
+            }
+        }
+    )
+
+    list(Pipeline(config, storage).fetch())
+
+    assert len(probe_source) == 1
+    source = probe_source[0]
+    assert source._min_request_interval == 1.5
+    assert source._max_retries == 7
+    assert source._backoff_base == 0.25
+    assert source._client.timeout.read == 3.5
+
+
+def test_fetch_uses_the_shared_defaults_when_the_block_says_nothing(
+    storage: SqliteStorage, probe_source: list[_ProbeSource]
+) -> None:
+    config = _make_config(sources={"probe": {"enabled": True}})
+
+    list(Pipeline(config, storage).fetch())
+
+    source = probe_source[0]
+    assert source._min_request_interval == 0.0
+    assert source._max_retries == DEFAULT_MAX_RETRIES
+    assert source._backoff_base == DEFAULT_BACKOFF_BASE
+    assert source._client.timeout.read == DEFAULT_TIMEOUT
+
+
+def test_an_invalid_http_policy_value_fails_that_source_cleanly(
+    storage: SqliteStorage, probe_source: list[_ProbeSource]
+) -> None:
+    """A bad value is a config error for one source, not a traceback."""
+    config = _make_config(sources={"probe": {"enabled": True, "min_request_interval": -1}})
+
+    results = list(Pipeline(config, storage).fetch())
+
+    assert len(results) == 1
+    assert results[0].failed is True
+    assert "min_request_interval" in results[0].errors[0]

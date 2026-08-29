@@ -51,6 +51,14 @@ profile:
     - France
     - Remote - EU
 
+# Every source below also accepts the same four HTTP options, whatever else
+# it reads. They are shown once here, on the source where they matter most;
+# any of them can be set on any source block.
+#
+#   timeout: 10.0               # seconds before one request gives up
+#   max_retries: 3              # retries per request, on top of the first
+#   backoff_base: 1.0           # seconds; the delay doubles per retry
+#   min_request_interval: 0.0   # seconds between two requests (0 = no pacing)
 sources:
   # RSS feed source (see sources/weworkremotely.py). Enabled by default and
   # needs no configuration: with no `feeds` set it reads the site-wide
@@ -64,8 +72,12 @@ sources:
       - remote-programming-jobs
     # Off by default: fetching every posting's own page (one extra request
     # per posting, on top of the feed requests) to get its full description
-    # instead of the RSS feed's truncated one.
+    # instead of the RSS feed's truncated one. Turning it on turns a handful
+    # of requests into one per posting, so set `min_request_interval` below
+    # to at least 1.0 before you do - it is what spaces them out, and
+    # without it the whole feed is hammered at full speed.
     fetch_full_description: false
+    min_request_interval: 0.0
     max_postings_per_feed: 50
 
   # JSON API source (see sources/greenhouse.py). One request per configured

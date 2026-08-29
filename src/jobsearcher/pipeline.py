@@ -36,7 +36,12 @@ import jobsearcher.sources  # noqa: F401  (import registers the built-in sources
 from jobsearcher.config import AppConfig, PluginConfig, SearchConfig
 from jobsearcher.exporters import ExporterConfigError, ExporterError, ExportResult, get_exporter
 from jobsearcher.models import ApplicationStatus, JobPosting, ScoreResult, WorkMode
-from jobsearcher.scoring import ScorerBudgetExhaustedError, ScoringConfigError, get_scorer
+from jobsearcher.scoring import (
+    ScorerBudgetExhaustedError,
+    ScorerConfigError,
+    ScoringError,
+    get_scorer,
+)
 from jobsearcher.sources.base import SourceError, get_source_class
 from jobsearcher.storage import Storage, StorageConfigError
 
@@ -264,6 +269,9 @@ class Pipeline:
             return SourceFetchResult(name, 0, 0, 0, 0, 0, (message,), failed=True)
 
         try:
+            # `block` carries the source's own options and the shared HTTP
+            # policy alike; the source reads both (see `SourceHttpConfig`),
+            # so a bad value for either surfaces here as a SourceError.
             source = source_cls(name, block)
         except SourceError as exc:
             logger.error("source %r could not be initialized: %s", name, exc)
@@ -336,11 +344,17 @@ class Pipeline:
             budget (iteration stops right after it).
 
         Raises:
-            PipelineError: If the scoring backend cannot be built.
+            PipelineError: If the scoring backend cannot be built — an
+                unknown backend name, an invalid option, a missing API key.
+                Every such failure reaches here as a
+                :class:`~jobsearcher.scoring.base.ScorerConfigError`,
+                which is the scorer contract's own class for it; catching
+                the concrete exceptions one backend happens to raise would
+                break on the next backend that raises another.
         """
         try:
             scorer = get_scorer(self._config.scoring)
-        except (ScoringConfigError, ValueError) as exc:
+        except ScorerConfigError as exc:
             raise PipelineError(str(exc)) from exc
 
         profile = self._config.profile
@@ -361,7 +375,7 @@ class Pipeline:
                 except ScorerBudgetExhaustedError as exc:
                     yield ScoredPosting(posting, None, str(exc), stopped_early=True)
                     return
-                except RuntimeError as exc:
+                except ScoringError as exc:
                     logger.warning("could not score %s: %s", posting.url, exc)
                     yield ScoredPosting(posting, None, str(exc))
                     continue

@@ -19,6 +19,9 @@ from click.testing import CliRunner
 
 import jobsearcher
 from jobsearcher.cli import main
+from jobsearcher.sources.base import _REGISTRY, register_source
+
+from .conftest import FakeSource
 
 _WIDE_ENV = {"COLUMNS": "220"}
 
@@ -641,3 +644,79 @@ def test_score_explains_the_renamed_llm_budget_key(
     assert result.exit_code == 1
     assert "max_requests_per_run" in result.output
     assert "Extra inputs are not permitted" not in result.output
+
+
+@pytest.fixture
+def second_fake_source() -> Iterator[None]:
+    """A second name for the network-free fake source, to build a mixed run."""
+    register_source("fake-2")(FakeSource)
+    try:
+        yield
+    finally:
+        _REGISTRY.pop("fake-2", None)
+
+
+def test_fetch_exits_1_when_one_source_among_several_fails(
+    runner: CliRunner, second_fake_source: None
+) -> None:
+    """`fetch` and `run` must agree: a dead source is a failed run.
+
+    A cron job on `fetch` that only fails when *every* source is down
+    ignores a source that has been broken for three weeks.
+    """
+    _write_config(
+        sources={
+            "fake": {
+                "enabled": True,
+                "postings": [{"url": "https://jobs.test/1", "title": "Backend Engineer"}],
+            },
+            "fake-2": {"enabled": True, "postings": [], "fail": True},
+        }
+    )
+
+    result = _invoke(runner, "fetch")
+
+    assert result.exit_code == 1, result.output
+    # The healthy source still stored its posting: the exit code reports the
+    # failure, it does not undo the work.
+    listed = _invoke(runner, "list")
+    assert "Backend Engineer" in listed.output
+
+
+def test_fetch_and_run_agree_on_the_exit_code_for_the_same_failure(
+    runner: CliRunner, second_fake_source: None
+) -> None:
+    _write_config(
+        sources={
+            "fake": {
+                "enabled": True,
+                "postings": [{"url": "https://jobs.test/1", "title": "Backend Engineer"}],
+            },
+            "fake-2": {"enabled": True, "postings": [], "fail": True},
+        },
+        exporters={},
+    )
+
+    fetched = _invoke(runner, "fetch")
+    ran = _invoke(runner, "run", "--skip-score")
+
+    assert fetched.exit_code == ran.exit_code == 1
+
+
+def test_fetch_still_exits_0_when_every_source_succeeds(
+    runner: CliRunner, second_fake_source: None
+) -> None:
+    _write_config(
+        sources={
+            "fake": {
+                "enabled": True,
+                "postings": [{"url": "https://jobs.test/1", "title": "Backend Engineer"}],
+            },
+            "fake-2": {
+                "enabled": True,
+                "postings": [{"url": "https://jobs.test/2", "title": "Django Developer"}],
+            },
+        }
+    )
+
+    assert _invoke(runner, "fetch").exit_code == 0

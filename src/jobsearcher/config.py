@@ -8,6 +8,7 @@ the public names below re-exported unchanged from config/__init__.py.
 
 from __future__ import annotations
 
+import difflib
 import importlib.resources
 import logging
 from pathlib import Path
@@ -46,7 +47,14 @@ class ConfigError(Exception):
 
 
 class SearchConfig(BaseModel):
-    """Keyword and language filters applied when collecting postings."""
+    """Keyword and language filters applied when collecting postings.
+
+    ``extra="forbid"``, like every plugin's own schema: a filter list that
+    is never read is invisible. ``title_keywords_exclud:`` would leave the
+    exclusions off and quietly widen the run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     title_keywords_include: list[str] = Field(default_factory=list)
     title_keywords_exclude: list[str] = Field(default_factory=list)
@@ -54,7 +62,15 @@ class SearchConfig(BaseModel):
 
 
 class ProfileConfig(BaseModel):
-    """The job seeker's profile, used as scoring input."""
+    """The job seeker's profile, used as scoring input.
+
+    ``extra="forbid"`` because this is where a typo costs the most: the
+    scorers read ``skills`` and ``absent_skills`` and nothing else, so
+    ``skils:`` produces a profile with no skills at all — every posting
+    scored 0, with nothing anywhere saying why.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     role: str
     skills: list[str] = Field(default_factory=list)
@@ -87,7 +103,19 @@ class BackendSectionConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Root JobSearcher configuration, loaded from config.yaml."""
+    """Root JobSearcher configuration, loaded from config.yaml.
+
+    ``extra="forbid"``, for the same reason every source, scorer and
+    exporter schema forbids unknown keys: a key nothing reads is a key the
+    user believes is doing something. ``sourcess:`` collects from no source
+    at all, and the run that follows looks like a quiet day on the job
+    market. The permissive schema in this file is
+    :class:`PluginConfig`, and only because it is shared by every plugin and
+    cannot know which keys belong to which one — each plugin re-validates
+    its own block strictly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     search: SearchConfig = Field(default_factory=SearchConfig)
     profile: ProfileConfig
@@ -151,9 +179,61 @@ def _parse_yaml(content: str, label: str) -> dict[str, Any]:
     return data
 
 
+def _schema_at(location: tuple[Any, ...]) -> type[BaseModel] | None:
+    """Return the schema that owns ``location``, walking down from AppConfig.
+
+    Args:
+        location: A prefix of a pydantic error location, e.g. ``("profile",)``.
+
+    Returns:
+        The model class at that path, or ``None`` if the path leaves the
+        typed schemas (a dict of plugin blocks, a list, a scalar).
+    """
+    model: type[BaseModel] = AppConfig
+    for part in location:
+        field = model.model_fields.get(str(part))
+        if field is None:
+            return None
+        annotation = field.annotation
+        if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
+            return None
+        model = annotation
+    return model
+
+
+def _closest_key(location: tuple[Any, ...]) -> str | None:
+    """Return the valid key nearest the unknown one reported at ``location``.
+
+    Args:
+        location: The full error location, whose last element is the
+            offending key.
+
+    Returns:
+        The closest field name of the schema that rejected the key, or
+        ``None`` when nothing is close enough to be worth suggesting.
+    """
+    schema = _schema_at(location[:-1])
+    if schema is None:
+        return None
+    matches = difflib.get_close_matches(str(location[-1]), list(schema.model_fields), n=1)
+    return matches[0] if matches else None
+
+
 def _format_validation_error(path: str, exc: ValidationError) -> str:
+    """Render a pydantic failure as lines the user can act on.
+
+    An unknown key gets its own phrasing: pydantic's "Extra inputs are not
+    permitted" says that a key is wrong without saying which one is right,
+    and handing back the correct spelling is the whole point of refusing a
+    typo instead of ignoring it.
+    """
     lines = [f"Invalid configuration in '{path}':"]
     for error in exc.errors():
         location = ".".join(str(part) for part in error["loc"]) or "<root>"
-        lines.append(f"  - {location}: {error['msg']}")
+        if error["type"] == "extra_forbidden" and error["loc"]:
+            suggestion = _closest_key(error["loc"])
+            hint = f" - did you mean '{suggestion}'?" if suggestion else ""
+            lines.append(f"  - {location}: unknown key '{error['loc'][-1]}'{hint}")
+        else:
+            lines.append(f"  - {location}: {error['msg']}")
     return "\n".join(lines)

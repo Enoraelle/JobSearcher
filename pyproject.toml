@@ -88,7 +88,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=jobsearcher --cov-report=term-missing"
+# --cov-fail-under is set just under the coverage the suite currently
+# reaches (96%), so a change that stops covering what is covered today fails
+# CI instead of being noticed months later. The point is the ratchet, not
+# the number: raise it when the suite earns it.
+addopts = "--cov=jobsearcher --cov-report=term-missing --cov-fail-under=95"
 
 [tool.coverage.run]
 source = ["src/jobsearcher"]

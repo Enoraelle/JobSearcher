@@ -54,13 +54,15 @@ from typing import Any, Final
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import Field, ValidationError
 
 from jobsearcher.config import PluginConfig
-from jobsearcher.models import JobPosting, WorkMode
+from jobsearcher.models import JobPosting
+from jobsearcher.sources._work_mode import infer_work_mode
 from jobsearcher.sources.base import (
     Source,
     SourceConfigError,
+    SourceHttpConfig,
     SourceUnavailableError,
     register_source,
 )
@@ -87,25 +89,26 @@ _EXCERPT_SELECTOR: Final[str] = "[data-testid='search-tile-excerpt']"
 
 # Free-text markers used to infer `WorkMode` from a card's location/contract
 # text, which on free-work.com carries phrasing like "Télétravail total"
-# rather than a structured remote flag.
+# rather than a structured remote flag. Only the vocabulary lives here: the
+# reading of it — whole tokens, negations — is shared with every other
+# source in `jobsearcher.sources._work_mode`, because a second copy of that
+# is how this source came to file "This role is not remote" under REMOTE.
 _REMOTE_MARKERS: Final[frozenset[str]] = frozenset(
     {"télétravail total", "100% télétravail", "full remote", "remote"}
 )
 _HYBRID_MARKERS: Final[frozenset[str]] = frozenset({"télétravail partiel", "hybride", "hybrid"})
 
 
-class FreeworkSourceConfig(BaseModel):
+class FreeworkSourceConfig(SourceHttpConfig):
     """Typed, validated configuration for `FreeworkSource`.
 
     Re-validated from the permissive `PluginConfig` once we know we're
     dealing with free-work.com specifically, the same way
     `GreenhouseSourceConfig` is — see that class's docstring for why
-    `extra="forbid"` matters here.
+    `extra="forbid"` matters here, and `SourceHttpConfig` for the shared
+    HTTP-policy options this inherits.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
     keywords: list[str] = Field(min_length=1)
     max_postings_per_keyword: int | None = Field(default=None, ge=1)
 
@@ -189,17 +192,6 @@ def _parse_search_results(html_content: str, base_url: str) -> list[dict[str, st
     return raw_items
 
 
-def _infer_work_mode(location: str | None, contract_type: str | None) -> WorkMode:
-    haystack = f"{location or ''} {contract_type or ''}".lower()
-    if any(marker in haystack for marker in _REMOTE_MARKERS):
-        return WorkMode.REMOTE
-    if any(marker in haystack for marker in _HYBRID_MARKERS):
-        return WorkMode.HYBRID
-    if location:
-        return WorkMode.ONSITE
-    return WorkMode.UNKNOWN
-
-
 @register_source("freework")
 class FreeworkSource(Source):
     """Job source backed by scraping free-work.com's tech/IT job search."""
@@ -212,7 +204,9 @@ class FreeworkSource(Source):
             config: This source's configuration block; re-validated into
                 `FreeworkSourceConfig`.
             **kwargs: Passed through to `Source.__init__` (`client`,
-                `max_retries`, `backoff_base`, `min_request_interval`).
+                `timeout`, `max_retries`, `backoff_base`,
+                `min_request_interval`); the pipeline fills these from the
+                same config block.
 
         Raises:
             SourceConfigError: If `config` doesn't validate as
@@ -302,7 +296,12 @@ class FreeworkSource(Source):
             description_raw=description,
             description_clean=description or None,
             location=location,
-            work_mode=_infer_work_mode(location, contract_type),
+            work_mode=infer_work_mode(
+                location,
+                contract_type,
+                remote_markers=_REMOTE_MARKERS,
+                hybrid_markers=_HYBRID_MARKERS,
+            ),
             contract_type=contract_type,
             salary_text=raw.get("salary_text"),
             fetched_at=datetime.now(UTC),

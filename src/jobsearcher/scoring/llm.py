@@ -53,6 +53,8 @@ from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult
 from jobsearcher.scoring.base import (
     ScorerBudgetExhaustedError,
+    ScorerConfigError,
+    ScoringError,
     evaluate_location_match,
     evaluate_work_mode_match,
 )
@@ -91,11 +93,24 @@ _SYSTEM_PROMPT: Final = (
 )
 
 
-class LlmScoringError(RuntimeError):
+class LlmConfigError(ScorerConfigError):
+    """This scorer cannot run as configured: a bad option, or no API key.
+
+    A :class:`~jobsearcher.scoring.base.ScorerConfigError`, which is what
+    the pipeline catches before the scoring phase starts. A missing API key
+    is the single most likely failure of this backend, and it has to reach
+    the user as a sentence naming the environment variable to export — not
+    as a traceback out of the middle of a run.
+    """
+
+
+class LlmScoringError(ScoringError):
     """The model could not produce a valid score for a posting.
 
-    Raised after the retry is exhausted. The caller should leave the posting
-    unscored (or fall back to the keyword score); it must not invent one.
+    Raised after the retry is exhausted. A per-posting failure under the
+    scorer contract (see :class:`~jobsearcher.scoring.base.Scorer`): the
+    caller leaves the posting unscored (or falls back to the keyword score)
+    and carries on; it must not invent a score.
     """
 
 
@@ -249,19 +264,20 @@ class LlmScorer:
                 :meth:`close`. Pass one in for testing.
 
         Raises:
-            ValueError: If ``config`` does not validate as
-                :class:`LlmScorerConfig`.
-            LlmScoringError: If the configured environment variable holds no
-                API key.
+            LlmConfigError: If ``config`` does not validate as
+                :class:`LlmScorerConfig`, or the configured environment
+                variable holds no API key. Both are config failures under
+                the scorer contract (see
+                :class:`~jobsearcher.scoring.base.Scorer`).
         """
         try:
             self._config = LlmScorerConfig.model_validate(config.model_dump())
         except ValidationError as exc:
-            raise ValueError(_explain_config_error(exc)) from exc
+            raise LlmConfigError(_explain_config_error(exc)) from exc
 
         api_key = os.environ.get(self._config.api_key_env, "").strip()
         if not api_key:
-            raise LlmScoringError(
+            raise LlmConfigError(
                 f"environment variable {self._config.api_key_env!r} is not set; "
                 f"the LLM scorer needs an API key there (it is never read from config)"
             )

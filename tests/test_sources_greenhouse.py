@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -352,3 +353,44 @@ def test_the_location_field_outranks_the_description() -> None:
     posting = source.normalize(raw)
 
     assert posting.work_mode is WorkMode.REMOTE
+
+
+def test_http_policy_options_are_part_of_the_source_configuration() -> None:
+    source = GreenhouseSource(
+        "greenhouse",
+        PluginConfig(
+            companies=["examplecorp"],
+            min_request_interval=0.5,
+            max_retries=1,
+            backoff_base=0.01,
+            timeout=2.5,
+        ),
+    )
+    with source:
+        assert source._min_request_interval == 0.5
+
+
+def test_an_unparsable_published_date_is_logged_not_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dropping a field silently leaves nothing to debug from."""
+    source = _source(_fixture_handler)
+    raw = {**FIXTURE_JOBS["jobs"][0], "_company_slug": "examplecorp", "updated_at": "yesterday"}
+
+    with caplog.at_level(logging.WARNING):
+        posting = source.normalize(raw)
+
+    assert posting.published_at is None
+    assert any("yesterday" in record.getMessage() for record in caplog.records)
+
+
+def test_a_missing_published_date_is_not_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """No value is not a parse failure, and must not produce noise."""
+    source = _source(_fixture_handler)
+    raw = {**FIXTURE_JOBS["jobs"][0], "_company_slug": "examplecorp"}
+    raw.pop("updated_at", None)
+
+    with caplog.at_level(logging.WARNING):
+        source.normalize(raw)
+
+    assert caplog.records == []

@@ -13,8 +13,8 @@ posting is derived from the configured slug itself (see `_humanize_slug`).
 Two quirks of that response shape are handled here rather than downstream:
 the `content` field arrives HTML-*escaped* and has to be unescaped before it
 can be parsed as markup (see `_description_html`), and there is no
-structured remote/hybrid flag, so the work mode is inferred (see
-`_infer_work_mode`).
+structured remote/hybrid flag, so the work mode is inferred by the shared
+reader in `jobsearcher.sources._work_mode`.
 
 A realistic configuration lists ten to seventy company slugs. Each is an
 independent unit of collection: `fetch_raw` fetches and yields one company's
@@ -32,22 +32,27 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import Field, ValidationError
 
 from jobsearcher.config import PluginConfig
-from jobsearcher.models import JobPosting, WorkMode
+from jobsearcher.models import JobPosting
 from jobsearcher.sources._html import strip_html
+from jobsearcher.sources._work_mode import infer_work_mode
 from jobsearcher.sources.base import (
     Source,
     SourceConfigError,
+    SourceHttpConfig,
     SourceUnavailableError,
     register_source,
 )
+
+logger = logging.getLogger(__name__)
 
 _JOB_BOARD_URL: Final[str] = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
 
@@ -60,17 +65,6 @@ _REMOTE_LOCATION_RE: Final[re.Pattern[str]] = re.compile(
     r"remote\s*[-–—:]\s*(.+)",  # noqa: RUF001 (en/em dash used by real listings)
     re.IGNORECASE,
 )
-# Work-mode inference (see `_infer_work_mode`). A marker preceded by one of
-# these words within `_NEGATION_WINDOW` tokens is a mention of the
-# arrangement being ruled *out*, not offered. The set is kept small and
-# unambiguous on purpose: a missed negation only restores the previous
-# behaviour, while a word like "can" would negate the sentences that grant
-# remote work.
-_WORD_RE: Final[re.Pattern[str]] = re.compile(r"[a-z]+")
-_WORK_MODE_NEGATORS: Final[frozenset[str]] = frozenset(
-    {"no", "non", "not", "never", "neither", "nor", "without", "rarely"}
-)
-_NEGATION_WINDOW: Final[int] = 3
 
 _RESTRICTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"only candidates (?:based |located )?in ([A-Za-z ,]+)", re.IGNORECASE),
@@ -79,19 +73,17 @@ _RESTRICTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
 )
 
 
-class GreenhouseSourceConfig(BaseModel):
+class GreenhouseSourceConfig(SourceHttpConfig):
     """Typed, validated configuration for `GreenhouseSource`.
 
     Re-validated from the permissive `PluginConfig` once we know we're
     dealing with Greenhouse specifically. `PluginConfig` allows unknown keys
     because it's shared by every source and doesn't know which one it is;
-    this model forbids them, so a typo like `companys:` raises immediately
+    this model forbids them (inherited, with the shared HTTP-policy options,
+    from `SourceHttpConfig`), so a typo like `companys:` raises immediately
     instead of silently producing a source that never collects anything.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
     companies: list[str] = Field(min_length=1)
     max_postings_per_company: int | None = Field(default=None, ge=1)
 
@@ -135,60 +127,6 @@ def _extract_location_name(raw: dict[str, Any]) -> str | None:
     return None
 
 
-def _mode_is_asserted(tokens: list[str], marker: str) -> bool:
-    """Whether ``marker`` appears as a whole token that is not negated.
-
-    Two things go wrong with a plain ``marker in text`` over a description:
-    it fires inside longer words, and — far more often — it fires on the
-    sentence that rules the arrangement *out*. "This role is not remote" is
-    the single most common way a posting mentions remote work, and reading
-    it as REMOTE puts the posting straight into `--remote`.
-
-    Args:
-        tokens: The lowercased word tokens of the text to search.
-        marker: The whole token to look for.
-
-    Returns:
-        Whether at least one occurrence of ``marker`` stands unnegated.
-    """
-    return any(
-        token == marker
-        and not _WORK_MODE_NEGATORS.intersection(tokens[max(0, index - _NEGATION_WINDOW) : index])
-        for index, token in enumerate(tokens)
-    )
-
-
-def _infer_work_mode(location_name: str | None, description_clean: str) -> WorkMode:
-    """Best-effort work arrangement, since Greenhouse has no field for it.
-
-    `location.name` is checked first and on its own: it is the board's own
-    assertion about the job, while the description is prose in which the
-    word "remote" turns up in negations, asides about other teams, and
-    boilerplate. The description is only consulted when the location says
-    nothing about the arrangement, and then only for unnegated whole-token
-    mentions (see `_mode_is_asserted`).
-
-    `--remote` filters on the result, so this errs toward ONSITE/UNKNOWN
-    rather than claiming an arrangement the posting did not assert.
-    """
-    if location_name:
-        location_tokens = _WORD_RE.findall(location_name.casefold())
-        if _mode_is_asserted(location_tokens, "remote"):
-            return WorkMode.REMOTE
-        if _mode_is_asserted(location_tokens, "hybrid"):
-            return WorkMode.HYBRID
-
-    description_tokens = _WORD_RE.findall(description_clean.casefold())
-    if _mode_is_asserted(description_tokens, "remote"):
-        return WorkMode.REMOTE
-    if _mode_is_asserted(description_tokens, "hybrid"):
-        return WorkMode.HYBRID
-
-    if location_name:
-        return WorkMode.ONSITE
-    return WorkMode.UNKNOWN
-
-
 def _extract_eligible_locations(location_name: str | None, description_clean: str) -> list[str]:
     """Best-effort extraction of geographic eligibility restrictions.
 
@@ -228,13 +166,23 @@ def _parse_datetime(value: Any) -> datetime | None:
         value: The raw `updated_at` field, of whatever type the API sent.
 
     Returns:
-        The timestamp in UTC, or `None` if there is none to read.
+        The timestamp in UTC, or `None` if there is none to read, or `None`
+        with a logged warning if there was one and it could not be read.
     """
     if not isinstance(value, str) or not value:
+        # No timestamp at all is ordinary: an optional field, nothing to say.
         return None
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
+        # A value that is there and unreadable is not ordinary. Returning
+        # None in silence leaves a posting with no date and no trace of why,
+        # which is unresearchable the day the API changes its format.
+        logger.warning(
+            "Greenhouse: could not parse the timestamp %r; the posting is kept "
+            "without a published date.",
+            value,
+        )
         return None
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
@@ -253,7 +201,9 @@ class GreenhouseSource(Source):
             config: This source's configuration block; re-validated into
                 `GreenhouseSourceConfig`.
             **kwargs: Passed through to `Source.__init__` (`client`,
-                `max_retries`, `backoff_base`, `min_request_interval`).
+                `timeout`, `max_retries`, `backoff_base`,
+                `min_request_interval`); the pipeline fills these from the
+                same config block.
 
         Raises:
             SourceConfigError: If `config` doesn't validate as
@@ -349,7 +299,7 @@ class GreenhouseSource(Source):
             description_raw=description_raw,
             description_clean=description_clean,
             location=location_name,
-            work_mode=_infer_work_mode(location_name, description_clean),
+            work_mode=infer_work_mode(location_name, description_clean),
             published_at=_parse_datetime(raw.get("updated_at")),
             fetched_at=datetime.now(UTC),
             eligible_locations=_extract_eligible_locations(location_name, description_clean),

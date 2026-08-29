@@ -24,8 +24,12 @@ token to run the suite either.
 
 ## The checks
 
-CI (`.github/workflows/ci.yml`) runs three things on Python 3.11 and 3.12.
-Run all three locally before opening a pull request:
+CI (`.github/workflows/ci.yml`) runs these on Python 3.11, 3.12 and 3.13,
+on Linux and on Windows, plus a separate job that builds the wheel, installs
+it into an empty virtualenv and runs `jobsearcher init` from it (an editable
+install reads the example config straight out of `src/`, so only a real
+wheel can show that it ships). Run all four locally before opening a pull
+request:
 
 ```bash
 ruff check .          # lint
@@ -40,9 +44,12 @@ pytest                # tests, with coverage
   `Any` unless there is genuinely no alternative (and leave a comment when
   there isn't).
 - **pytest** is configured in `pyproject.toml` to collect from `tests/` and
-  report coverage. Run a single file with `pytest tests/test_scoring_keyword.py`,
-  a single test with `pytest tests/test_scoring_keyword.py::test_name`, and
-  skip the coverage report with `pytest --no-cov` while iterating.
+  report coverage, with `--cov-fail-under` set just under what the suite
+  currently reaches: a change that stops covering what is covered today
+  fails rather than passing quietly. Run a single file with
+  `pytest tests/test_scoring_keyword.py`, a single test with
+  `pytest tests/test_scoring_keyword.py::test_name`, and skip the coverage
+  report with `pytest --no-cov` while iterating.
 
 ### Tests never touch the network
 
@@ -147,19 +154,24 @@ class YourSource(Source):
 the name used in `config.yaml`'s `sources:` section — no registry file to
 edit by hand.
 
-### 2. Define a typed config model, with `extra="forbid"`
+### 2. Define a typed config model, inheriting `SourceHttpConfig`
 
 `PluginConfig` (in `config.py`) is deliberately permissive (`extra="allow"`)
 because it's shared by every source and doesn't know which one it is. Once
 your `__init__` knows it's building *your* source, re-validate into a model
 that forbids unknown keys, so a typo in `config.yaml` raises immediately
-instead of silently producing a source that collects nothing:
+instead of silently producing a source that collects nothing.
+
+Subclass `SourceHttpConfig` from `sources/base.py` rather than `BaseModel`:
+it carries `extra="forbid"` and the four HTTP-policy options every source
+accepts (`enabled`, `timeout`, `max_retries`, `backoff_base`,
+`min_request_interval`). `Source.__init__` reads those from the config block
+itself, so declaring them is what makes them settable in `config.yaml` —
+a model that redeclared only `enabled` would reject `min_request_interval`
+as an unknown key and leave a user with no way to pace your source.
 
 ```python
-class YourSourceConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
+class YourSourceConfig(SourceHttpConfig):
     # ... your fields ...
 
 
@@ -296,6 +308,13 @@ Unlike sources, scorers are **not** auto-registered — `get_scorer` in
    Follow the two existing modules:
    [`keyword.py`](src/jobsearcher/scoring/keyword.py) for an offline, pure
    scorer, [`llm.py`](src/jobsearcher/scoring/llm.py) for an online one.
+   Raise only what the `Scorer` protocol declares: `ScorerConfigError` from
+   the constructor (the pipeline turns it into a clean message before the
+   phase starts), `ScoringError` for one posting it cannot score, and
+   `ScorerBudgetExhaustedError` when a metered scorer is out of budget.
+   Anything else escapes as a traceback — the pipeline catches these three
+   by name, and deliberately not by whatever base class today's scorers
+   happen to share.
 2. Re-validate your slice of the config into a typed model with
    `extra="forbid"`, exactly as `KeywordScorerConfig` does. Never read a
    secret from config — only from an environment variable named by a config
@@ -306,7 +325,8 @@ Unlike sources, scorers are **not** auto-registered — `get_scorer` in
 4. If your scorer is metered (costs money or rate-limited calls), raise a
    subclass of `ScorerBudgetExhaustedError` when the budget is spent. The
    pipeline catches it and ends the phase cleanly, leaving the rest for a
-   later run — it is not a failure.
+   later run — it is not a failure. A missing API key is not this: it is a
+   `ScorerConfigError` from the constructor, since no later run fixes it.
 5. Wire it into `get_scorer`: add a branch for your `backend` value, and
    import your module *inside that branch* if it talks to a paid or
    third-party service, so the default offline path never pays to import it

@@ -13,6 +13,9 @@ from jobsearcher.config import BackendSectionConfig
 from jobsearcher.scoring.base import (
     Scorer,
     ScorerBudgetExhaustedError,
+    ScorerConfigError,
+    ScorerError,
+    ScoringError,
     evaluate_location_match,
     evaluate_work_mode_match,
 )
@@ -21,8 +24,13 @@ from jobsearcher.scoring.keyword import KeywordScorer
 _KEYWORD_BACKENDS = frozenset({"keyword_match", "keyword"})
 
 
-class ScoringConfigError(Exception):
-    """The ``scoring:`` configuration names an unknown backend."""
+class ScoringConfigError(ScorerConfigError):
+    """The ``scoring:`` configuration names an unknown backend.
+
+    A :class:`~jobsearcher.scoring.base.ScorerConfigError`, so a caller that
+    handles "this scorer cannot be built" handles an unknown backend name
+    with it, without enumerating the ways a backend can be wrong.
+    """
 
 
 def get_scorer(config: BackendSectionConfig) -> Scorer:
@@ -39,7 +47,10 @@ def get_scorer(config: BackendSectionConfig) -> Scorer:
     Raises:
         ScoringConfigError: If ``backend`` is neither ``keyword_match`` nor
             ``llm``.
-        ValueError: If the backend-specific configuration is invalid.
+        ScorerConfigError: If the backend-specific configuration is invalid
+            (an unknown option, a value out of range, a missing API key).
+            ``ScoringConfigError`` is itself one of these, so catching
+            ``ScorerConfigError`` alone covers every way this can fail.
     """
     if config.backend in _KEYWORD_BACKENDS:
         return KeywordScorer(config)
@@ -56,7 +67,10 @@ __all__ = [
     "KeywordScorer",
     "Scorer",
     "ScorerBudgetExhaustedError",
+    "ScorerConfigError",
+    "ScorerError",
     "ScoringConfigError",
+    "ScoringError",
     "evaluate_location_match",
     "evaluate_work_mode_match",
     "get_scorer",

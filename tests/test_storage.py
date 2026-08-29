@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import jobsearcher.models
 from jobsearcher.config import BackendSectionConfig
 from jobsearcher.models import ApplicationStatus, JobPosting, WorkMode, posting_id
 from jobsearcher.storage import StorageConfigError, open_storage
@@ -978,3 +979,103 @@ def test_a_legacy_row_with_an_unusable_url_is_skipped_by_list_too(db_path: Path)
         assert [posting.url for posting in postings] == ["https://example.com/jobs/good"]
         assert storage.unreadable_rows == 1
         assert storage.count() == 2
+
+
+# --------------------------------------------------------------------------
+# The id backfill must never stand between the user and their database
+# --------------------------------------------------------------------------
+
+
+def _null_out_ids(db_path: Path) -> None:
+    """Put the rows back in the pre-schema-4 state the backfill exists for."""
+    connection = sqlite3.connect(db_path)
+    with connection:
+        connection.execute("UPDATE postings SET id = NULL")
+    connection.close()
+
+
+def _stored_ids(db_path: Path) -> list[Any]:
+    connection = sqlite3.connect(db_path)
+    try:
+        return [row[0] for row in connection.execute("SELECT id FROM postings ORDER BY url")]
+    finally:
+        connection.close()
+
+
+def test_backfill_survives_two_urls_normalizing_to_the_same_id(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A collision is logged and resolved; it never makes the database unopenable.
+
+    The trigger is the extension point models.py explicitly invites: one more
+    entry in the tracking-parameter list, and two distinct stored URLs
+    normalize to the same identifier. If that took the backfill down, every
+    command would die on open - including the export the README points at as
+    the way to rescue the data.
+    """
+    with SqliteStorage(db_path) as store:
+        store.save_many(
+            [
+                _make_posting(url="https://example.com/jobs/1?trk=newsletter"),
+                _make_posting(url="https://example.com/jobs/1?trk=twitter"),
+            ]
+        )
+    assert len(_stored_ids(db_path)) == 2
+    _null_out_ids(db_path)
+
+    monkeypatch.setattr(
+        jobsearcher.models,
+        "_TRACKING_PARAM_NAMES",
+        jobsearcher.models._TRACKING_PARAM_NAMES | {"trk"},
+    )
+
+    with caplog.at_level(logging.WARNING), SqliteStorage(db_path) as store:
+        postings = store.list()
+
+    # Both rows are still there and still readable.
+    assert len(postings) == 2
+    # Exactly one of the two colliding rows keeps the shared id; the other
+    # stays NULL, which the UNIQUE index tolerates.
+    ids = _stored_ids(db_path)
+    assert sorted(id_ is None for id_ in ids) == [False, True]
+    # And the user is told, with both URLs named.
+    collision_logs = [r.getMessage() for r in caplog.records if "trk=" in r.getMessage()]
+    assert collision_logs
+    assert "trk=newsletter" in " ".join(collision_logs)
+    assert "trk=twitter" in " ".join(collision_logs)
+
+
+def test_open_storage_does_not_blame_the_directory_for_a_file_it_could_open(
+    tmp_path: Path,
+) -> None:
+    """The message must point at the file, not at directory permissions."""
+    path = tmp_path / "not-a-database.db"
+    path.write_bytes(b"plain text, definitely not SQLite\n" * 10)
+
+    with pytest.raises(StorageConfigError) as exc_info:
+        open_storage(BackendSectionConfig(backend="sqlite", path=str(path)))
+
+    message = str(exc_info.value)
+    assert str(path) in message
+    assert "parent directory" not in message
+
+
+def test_list_breaks_fetched_at_ties_deterministically(storage: SqliteStorage) -> None:
+    """Postings fetched in the same run share a timestamp; paging must be stable.
+
+    With `ORDER BY fetched_at DESC` alone, rows fetched in the same second
+    are returned in whatever order SQLite finds convenient, so consecutive
+    `--limit`/`offset` pages can repeat one posting and never show another.
+    """
+    same_moment = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    postings = [
+        _make_posting(url=f"https://example.com/jobs/{index}", fetched_at=same_moment)
+        for index in range(6)
+    ]
+    storage.save_many(postings)
+    expected = sorted(posting.id for posting in postings)
+
+    assert [posting.id for posting in storage.list()] == expected
+
+    paged = [posting.id for offset in (0, 2, 4) for posting in storage.list(limit=2, offset=offset)]
+    assert paged == expected

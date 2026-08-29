@@ -10,6 +10,7 @@ from jobsearcher.config import (
     EXAMPLE_CONFIG_RESOURCE,
     AppConfig,
     ConfigError,
+    _closest_key,
     example_config_text,
     load_config,
 )
@@ -151,3 +152,75 @@ def test_load_config_top_level_not_a_mapping_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="must contain a YAML mapping"):
         load_config(config_path)
+
+
+# --------------------------------------------------------------------------
+# Unknown keys in the root schemas
+# --------------------------------------------------------------------------
+
+
+def _write_config(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "typo.yaml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_unknown_root_key_is_rejected_and_named(tmp_path: Path) -> None:
+    """A misspelled top-level section must not be silently ignored."""
+    config_path = _write_config(tmp_path, VALID_CONFIG.replace("sources:", "sourcess:"))
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_path)
+
+    message = str(exc_info.value)
+    assert "sourcess" in message
+    assert "sources" in message
+
+
+def test_unknown_profile_key_is_rejected_and_named(tmp_path: Path) -> None:
+    """`skils:` scores every posting 0 and says nothing; it must be an error."""
+    config_path = _write_config(
+        tmp_path,
+        VALID_CONFIG.replace("  skills:", "  skils:"),
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_path)
+
+    message = str(exc_info.value)
+    assert "profile.skils" in message
+    assert "skills" in message
+
+
+def test_unknown_search_key_is_rejected_and_named(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        VALID_CONFIG + "\nsearch:\n  title_keywords_exclud:\n    - senior\n",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_path)
+
+    message = str(exc_info.value)
+    assert "search.title_keywords_exclud" in message
+    assert "title_keywords_exclude" in message
+
+
+def test_an_unknown_key_with_no_close_match_is_still_rejected(tmp_path: Path) -> None:
+    """The suggestion is a bonus; the rejection is the point."""
+    config_path = _write_config(tmp_path, VALID_CONFIG + "\nzzzzzzzz: 1\n")
+
+    with pytest.raises(ConfigError, match="zzzzzzzz"):
+        load_config(config_path)
+
+
+def test_a_key_outside_the_typed_schemas_gets_no_suggestion() -> None:
+    """The suggestion stops where the strict schemas stop.
+
+    Under `sources:` and `exporters:` the keys belong to a plugin's own
+    model, which this module deliberately knows nothing about — guessing
+    from the wrong vocabulary would be worse than saying nothing.
+    """
+    assert _closest_key(("sources", "greenhouse", "companys")) is None
+    assert _closest_key(("profile", "skills", "0")) is None
+    assert _closest_key(("nosuchsection", "whatever")) is None

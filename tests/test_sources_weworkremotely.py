@@ -3,6 +3,7 @@ httpx is driven entirely through httpx.MockTransport."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -319,3 +320,39 @@ def test_html_entities_in_the_description_are_decoded() -> None:
     postings = list(source.fetch())
 
     assert postings[0].description_clean == "R&D in cafés"
+
+
+def test_http_policy_options_are_part_of_the_source_configuration() -> None:
+    """The docstring tells callers to pace this source; the key must exist.
+
+    `min_request_interval` has to survive the source's own `extra="forbid"`
+    re-validation, or the only cure for the `fetch_full_description`
+    fan-out is a config file that refuses to load.
+    """
+    source = WeWorkRemotelySource(
+        "weworkremotely",
+        PluginConfig(
+            fetch_full_description=True,
+            min_request_interval=1.5,
+            max_retries=1,
+            backoff_base=0.01,
+            timeout=2.5,
+        ),
+    )
+    with source:
+        assert source._min_request_interval == 1.5
+
+
+def test_an_unparsable_pubdate_is_logged_not_swallowed(caplog: pytest.LogCaptureFixture) -> None:
+    source = _source(_main_feed_handler)
+    raw = {
+        "title": "Acme: Backend Engineer",
+        "link": "https://weworkremotely.com/remote-jobs/acme-backend-engineer",
+        "pubDate": "last tuesday",
+    }
+
+    with caplog.at_level(logging.WARNING):
+        posting = source.normalize(raw)
+
+    assert posting.published_at is None
+    assert any("last tuesday" in record.getMessage() for record in caplog.records)

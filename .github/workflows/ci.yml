@@ -6,9 +6,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Windows is a supported platform, not a hypothetical one: the CLI carries
+    # code written for it (the cp1252 stdout re-encoding in `cli.py`), and
+    # paths, line endings and console encodings are exactly where a
+    # Linux-only matrix stops noticing.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - name: Check out repository
@@ -33,3 +39,45 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+  wheel:
+    # The test job installs the project in editable mode, where
+    # importlib.resources reads straight out of `src/` - so the example
+    # config resolves whether or not the wheel actually ships it, and the
+    # `force-include` entry in pyproject.toml could break without a single
+    # test noticing. This job is the one that would notice: it builds the
+    # wheel, installs it alone into an empty virtualenv, and runs the command
+    # that reads the file.
+    name: Wheel installs and runs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build the wheel
+        run: python -m pip wheel . --no-deps --wheel-dir dist
+
+      - name: Install it into a clean virtualenv
+        run: |
+          python -m venv .wheel-venv
+          .wheel-venv/bin/python -m pip install --upgrade pip
+          .wheel-venv/bin/python -m pip install dist/*.whl
+
+      - name: Run `jobsearcher init` outside the checkout
+        # Outside the checkout on purpose: run from the source tree and a
+        # stray config.example.yaml on disk could stand in for the packaged
+        # one.
+        run: |
+          set -e
+          venv="$PWD/.wheel-venv/bin"
+          workdir="$(mktemp -d)"
+          cd "$workdir"
+          "$venv/jobsearcher" init
+          test -s config.yaml
+          # The file it wrote has to be a config the tool can actually load.
+          "$venv/jobsearcher" list

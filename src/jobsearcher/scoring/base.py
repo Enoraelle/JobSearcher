@@ -30,7 +30,42 @@ from jobsearcher.models import JobPosting, ScoreResult, WorkMode
 _WORD_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-z]+")
 
 
-class ScorerBudgetExhaustedError(Exception):
+class ScorerError(Exception):
+    """Base class for every failure a scorer is allowed to raise.
+
+    The three subclasses below are the whole contract between a scorer and
+    the code that runs it. The pipeline catches *these*, by name — not
+    whatever concrete class today's scorers happen to use. An ``except``
+    clause that covers a scorer's errors by coincidence (``RuntimeError``,
+    ``ValueError``) works until the next scorer raises something else, and
+    then a routine misconfiguration reaches the user as a traceback.
+
+    A scorer that needs a new failure mode subclasses one of these rather
+    than inventing a class the pipeline has never heard of.
+    """
+
+
+class ScorerConfigError(ScorerError):
+    """The scorer cannot be built or run as configured.
+
+    Raised from a scorer's constructor: an unknown option, a value out of
+    range, a missing API key. Retrying changes nothing — the user has to
+    edit ``config.yaml`` or their environment, so the message must say
+    which. The pipeline turns this into a
+    :class:`~jobsearcher.pipeline.PipelineError` before the phase starts.
+    """
+
+
+class ScoringError(ScorerError):
+    """The scorer could not produce a score for one posting.
+
+    A per-posting failure, not a phase failure: the pipeline records it,
+    leaves that posting unscored for a later run, and moves on to the next
+    one.
+    """
+
+
+class ScorerBudgetExhaustedError(ScorerError):
     """A metered scorer has spent its per-run budget; stop calling it.
 
     Raised by scorers that cost money or rate-limited calls (see
@@ -43,7 +78,22 @@ class ScorerBudgetExhaustedError(Exception):
 
 
 class Scorer(Protocol):
-    """Turns a posting plus a profile into a :class:`ScoreResult`."""
+    """Turns a posting plus a profile into a :class:`ScoreResult`.
+
+    A scorer may raise exactly three things, and the pipeline handles each
+    differently:
+
+    - :class:`ScorerConfigError`, from the constructor, when the backend
+      cannot be built as configured. It ends the phase before it starts.
+    - :class:`ScoringError`, from :meth:`score`, when this one posting could
+      not be scored. The posting is left unscored and the phase continues.
+    - :class:`ScorerBudgetExhaustedError`, from :meth:`score`, when a
+      metered scorer has spent its per-run budget. The phase ends cleanly
+      and the remaining postings wait for the next run.
+
+    Anything else escaping a scorer is a bug in that scorer, not a
+    condition the pipeline pretends to understand.
+    """
 
     def score(self, posting: JobPosting, profile: ProfileConfig) -> ScoreResult:
         """Score ``posting`` against ``profile``.
@@ -58,6 +108,11 @@ class Scorer(Protocol):
 
         Returns:
             The score and its supporting detail.
+
+        Raises:
+            ScoringError: If this posting could not be scored.
+            ScorerBudgetExhaustedError: If a metered scorer has spent its
+                per-run budget.
         """
         ...
 
@@ -152,6 +207,9 @@ __all__ = [
     "ScoreResult",
     "Scorer",
     "ScorerBudgetExhaustedError",
+    "ScorerConfigError",
+    "ScorerError",
+    "ScoringError",
     "evaluate_location_match",
     "evaluate_work_mode_match",
 ]

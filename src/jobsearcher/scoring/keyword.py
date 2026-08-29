@@ -88,7 +88,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, ScoreResult
-from jobsearcher.scoring.base import evaluate_location_match, evaluate_work_mode_match
+from jobsearcher.scoring.base import (
+    ScorerConfigError,
+    evaluate_location_match,
+    evaluate_work_mode_match,
+)
 
 # Penalty subtracted from the [0, 1] coverage for each skill listed in
 # ``profile.absent_skills`` that shows up in a posting. 0.34 is roughly one
@@ -195,15 +199,17 @@ class KeywordScorer:
                 zero-config path want.
 
         Raises:
-            ValueError: If ``config`` does not validate as
+            ScorerConfigError: If ``config`` does not validate as
                 :class:`KeywordScorerConfig` (an unknown key, a negative
-                penalty, ...).
+                penalty, ...). This is the scorer contract's config failure
+                (see :class:`~jobsearcher.scoring.base.Scorer`), so the
+                pipeline reports it instead of letting it escape.
         """
         raw = config.model_dump() if config is not None else {"backend": "keyword_match"}
         try:
             self._config = KeywordScorerConfig.model_validate(raw)
         except ValidationError as exc:
-            raise ValueError(f"Invalid keyword scorer configuration: {exc}") from exc
+            raise ScorerConfigError(f"Invalid keyword scorer configuration: {exc}") from exc
         self._synonyms = _build_synonym_index(self._config.synonyms)
 
     def score(self, posting: JobPosting, profile: ProfileConfig) -> ScoreResult:

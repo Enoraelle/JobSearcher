@@ -67,6 +67,17 @@ _LIST_SEPARATOR = "; "
 # these as a formula rather than as text.
 _FORMULA_LEADS: tuple[str, ...] = ("=", "+", "-", "@")
 
+# Markdown's structural characters inside a link label, escaped in one pass
+# so the backslash this adds cannot itself be swallowed by a backslash
+# already in the text. See `_markdown_text` for why scraped values never
+# reach the output unescaped.
+_MARKDOWN_ESCAPES: dict[int, str] = str.maketrans({"\\": r"\\", "[": r"\[", "]": r"\]"})
+
+# Characters that end (or cannot appear in) a bare Markdown link
+# destination, and so force the angle-bracket form. See
+# `_markdown_destination`.
+_DESTINATION_NEEDS_BRACKETS: tuple[str, ...] = ("(", ")", "<", ">", " ")
+
 
 class _FileOptions(BaseModel):
     """The ``exporters.<name>`` block for a file exporter.
@@ -254,15 +265,65 @@ def _render_markdown(ordered: Sequence[JobPosting]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _markdown_text(value: str) -> str:
+    """Render scraped text as Markdown *text*, not as markup.
+
+    Titles and company names come off the web, and the bullet built below
+    puts them inside a link label — where a bracket is syntax. "Engineer
+    [Remote]" is an entirely ordinary title and already breaks the link; a
+    company name containing ``](https://elsewhere.test)`` closes the label
+    early and points the link somewhere else entirely. A newline is the
+    third case: a bullet is one line, and a title carrying a line break
+    splits one posting into two list items, the second of which is not a
+    posting.
+
+    Backslashes are escaped first (in the same pass, via ``str.translate``),
+    so an escape this function adds cannot be neutralized by one already in
+    the text.
+
+    Args:
+        value: Text to place inside Markdown output.
+
+    Returns:
+        ``value`` with internal whitespace collapsed to single spaces and
+        every Markdown-structural character escaped.
+    """
+    return " ".join(value.split()).translate(_MARKDOWN_ESCAPES)
+
+
+def _markdown_destination(url: str) -> str:
+    """Render a URL as a link destination that survives its own punctuation.
+
+    A bare destination ends at the first ``)``, so a perfectly valid posting
+    URL containing one truncates the link and spills the rest of itself into
+    the visible text. Angle brackets are Markdown's own way to delimit a
+    destination, and are used only for the URLs that need them: wrapping
+    every link would make the common case noisier for no gain. The only
+    characters that cannot appear between them are ``<`` and ``>``, which
+    are percent-encoded — lossless for a URL, unlike escaping.
+
+    Args:
+        url: The posting's normalized URL.
+
+    Returns:
+        The destination, ready to be placed between the link's parentheses.
+    """
+    if not any(char in url for char in _DESTINATION_NEEDS_BRACKETS):
+        return url
+    return "<" + url.replace("<", "%3C").replace(">", "%3E") + ">"
+
+
 def _markdown_bullet(posting: JobPosting) -> str:
     score = "n/a" if posting.score is None else str(posting.score)
-    segments = [f"**{score}** — [{posting.title} — {posting.company}]({posting.url})"]
+    label = f"{_markdown_text(posting.title)} — {_markdown_text(posting.company)}"
+    segments = [f"**{score}** — [{label}]({_markdown_destination(posting.url)})"]
     if posting.work_mode is not WorkMode.UNKNOWN:
         segments.append(posting.work_mode.value)
     if posting.location:
-        segments.append(posting.location)
+        segments.append(_markdown_text(posting.location))
     if posting.eligible_locations:
-        segments.append(f"eligible: {', '.join(posting.eligible_locations)}")
+        joined = ", ".join(_markdown_text(place) for place in posting.eligible_locations)
+        segments.append(f"eligible: {joined}")
     return "- " + " · ".join(segments)
 
 

@@ -304,3 +304,62 @@ def test_exporters_do_not_use_the_stdlib_csv_default_line_ending(tmp_path: Path)
     path = tmp_path / "jobs.csv"
     CsvExporter().export([_posting(score=1)], _opts(output_path=str(path)))
     assert "\r" not in path.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Markdown: scraped text is data, not markup
+# --------------------------------------------------------------------------
+
+
+def _markdown_bullet_for(tmp_path: Path, **overrides: Any) -> str:
+    path = tmp_path / "digest.md"
+    MarkdownExporter().export([_posting(**overrides)], _opts(output_path=str(path)))
+    bullets = [
+        line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("- ")
+    ]
+    assert len(bullets) == 1, path.read_text(encoding="utf-8")
+    return bullets[0]
+
+
+def test_markdown_keeps_the_link_intact_for_a_title_with_brackets(tmp_path: Path) -> None:
+    """ "Engineer [Remote]" is an ordinary title and must not break the link."""
+    bullet = _markdown_bullet_for(tmp_path, title="Engineer [Remote]")
+
+    assert r"Engineer \[Remote\]" in bullet
+    assert bullet.endswith("(https://example.com/jobs/1)")
+
+
+def test_markdown_company_cannot_hijack_the_link_target(tmp_path: Path) -> None:
+    """A company name is scraped text; it must not be able to retarget a link."""
+    bullet = _markdown_bullet_for(tmp_path, company="Acme](https://evil.test)")
+
+    # The injected bracket is escaped, so it stays part of the label text and
+    # the link still points where the exporter put it.
+    assert r"Acme\](https://evil.test)" in bullet
+    assert bullet.endswith("(https://example.com/jobs/1)")
+
+
+def test_markdown_keeps_one_posting_on_one_bullet(tmp_path: Path) -> None:
+    """A newline inside a title must not split the bullet in two."""
+    bullet = _markdown_bullet_for(tmp_path, title="Backend Engineer\nRemote  friendly")
+
+    assert "\n" not in bullet
+    assert "Backend Engineer Remote friendly" in bullet
+
+
+def test_markdown_escapes_brackets_in_the_location_fields(tmp_path: Path) -> None:
+    bullet = _markdown_bullet_for(
+        tmp_path,
+        location="Paris [FR]",
+        eligible_locations=["EU [only]"],
+    )
+
+    assert r"Paris \[FR\]" in bullet
+    assert r"EU \[only\]" in bullet
+
+
+def test_markdown_link_survives_a_parenthesis_in_the_url(tmp_path: Path) -> None:
+    """A `)` in the URL ends the link destination early if left bare."""
+    bullet = _markdown_bullet_for(tmp_path, url="https://example.com/jobs/lead(backend)")
+
+    assert bullet.endswith("(<https://example.com/jobs/lead(backend)>)")

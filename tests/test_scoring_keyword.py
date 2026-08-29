@@ -14,6 +14,7 @@ import pytest
 
 from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, WorkMode
+from jobsearcher.scoring import ScorerConfigError
 from jobsearcher.scoring.keyword import (
     DEFAULT_ABSENT_SKILL_PENALTY,
     KeywordScorer,
@@ -344,13 +345,13 @@ class TestEdgeCases:
 
 class TestConfigValidation:
     def test_unknown_key_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match=r"[Ii]nvalid"):
+        with pytest.raises(ScorerConfigError, match=r"[Ii]nvalid"):
             KeywordScorer(BackendSectionConfig(backend="keyword_match", synonynms=[]))
 
     def test_negative_penalty_is_rejected(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ScorerConfigError):
             _scorer(absent_skill_penalty=-0.1)
 
     def test_penalty_cap_above_one_is_rejected(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ScorerConfigError):
             _scorer(absent_skill_penalty_cap=1.5)

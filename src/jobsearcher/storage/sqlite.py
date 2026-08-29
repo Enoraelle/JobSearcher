@@ -383,29 +383,75 @@ class SqliteStorage:
         allowed to raise: one unusable row must not stand between the user
         and every command, including the ones they would need to inspect or
         repair it. Its `id` stays NULL, which the UNIQUE index tolerates.
+
+        Two rows can also end up wanting the *same* id. The identifier is
+        derived from the normalized URL, and normalization is an explicit
+        extension point — `_TRACKING_PARAM_NAMES` in `jobsearcher.models`
+        says outright to edit it — so one new tracking parameter is enough
+        for two stored URLs that used to differ to collapse onto one
+        identifier. Writing both would violate the UNIQUE index, and since
+        this runs while opening the database, the failure would not cost one
+        row: it would make every command die on open, the `export` the
+        README points at for rescuing the data included. A collision is
+        therefore treated exactly like an unnormalizable URL — logged, with
+        both URLs named, and the id left on one row only.
         """
         rows = self._connection.execute("SELECT url FROM postings WHERE id IS NULL").fetchall()
         if not rows:
             return
 
+        # Identifiers already spoken for, mapped to the URL holding each, so
+        # a collision can name both sides.
+        taken: dict[str, str] = {
+            str(row["id"]): str(row["url"])
+            for row in self._connection.execute("SELECT id, url FROM postings WHERE id IS NOT NULL")
+        }
         updates: list[tuple[str, str]] = []
-        for row in rows:
+        # Sorted, so which row of a colliding pair keeps the identifier is
+        # decided by the data and not by the order SQLite happened to scan.
+        for url in sorted(str(row["url"]) for row in rows):
             try:
-                updates.append((posting_id(row["url"]), row["url"]))
+                new_id = posting_id(url)
             except ValueError as exc:
                 logger.warning(
                     "Skipping the id backfill for stored posting %r: %s. "
                     "The row is kept, but commands that resolve postings by id "
                     "will not find it.",
-                    row["url"],
+                    url,
                     exc,
                 )
+                continue
+            holder = taken.get(new_id)
+            if holder is not None:
+                logger.warning(
+                    "Stored postings %r and %r both normalize to the identifier %s. "
+                    "Keeping it on %r; the other row is kept too but stays without an id, "
+                    "so commands that resolve postings by id will not find it.",
+                    holder,
+                    url,
+                    new_id,
+                    holder,
+                )
+                continue
+            taken[new_id] = url
+            updates.append((new_id, url))
         if not updates:
             return
-        with self._connection:
-            self._connection.executemany(
-                "UPDATE postings SET id = ? WHERE url = ?",
-                updates,
+        try:
+            with self._connection:
+                self._connection.executemany(
+                    "UPDATE postings SET id = ? WHERE url = ?",
+                    updates,
+                )
+        except sqlite3.IntegrityError as exc:  # pragma: no cover - guarded above
+            # The loop above assigns each id at most once, so nothing should
+            # reach this. It stays because the cost of being wrong is a
+            # database nobody can open: the transaction rolls back, the ids
+            # stay NULL, and every command still runs.
+            logger.warning(
+                "Could not backfill posting ids: %s. The rows are kept and every command "
+                "still works, but the ones without an id cannot be resolved by id.",
+                exc,
             )
 
     @property
@@ -497,7 +543,7 @@ class SqliteStorage:
             none match.
         """
         rows = self._connection.execute(
-            "SELECT * FROM postings WHERE id LIKE ? ESCAPE '\\' ORDER BY fetched_at DESC",
+            "SELECT * FROM postings WHERE id LIKE ? ESCAPE '\\' ORDER BY fetched_at DESC, id",
             (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
         ).fetchall()
         return self._decode(rows)
@@ -526,7 +572,12 @@ class SqliteStorage:
         sql = "SELECT * FROM postings"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY fetched_at DESC"
+        # `id` breaks ties: one fetch stores dozens of postings within the
+        # same second, and `fetched_at` alone leaves their relative order to
+        # SQLite. That is fine for a single query and wrong across a paged
+        # read, where an unstable order can show one posting on two
+        # consecutive pages and never show another at all.
+        sql += " ORDER BY fetched_at DESC, id"
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])

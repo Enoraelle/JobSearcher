@@ -98,7 +98,9 @@ imports.
   success. Rate limiting is affected the same way: `min_request_interval`
   is the source's single global spacing, sized in every other source for
   one request per unit, which is why this source's docstring has to tell
-  callers to set it when they enable the option. Deliberate for v1 (the
+  whoever enables the option to set it in the same config block (it is one
+  of the shared options in `SourceHttpConfig`, applied by `Source.__init__`
+  from the source's own configuration). Deliberate for v1 (the
   fan-out is opt-in and degrades rather than fails), and no code change is
   proposed here — but anyone reasoning about item counts, recorded errors,
   or request pacing should know `normalize` is not side-effect-free.

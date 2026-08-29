@@ -17,6 +17,7 @@ from jobsearcher.config import BackendSectionConfig, ProfileConfig
 from jobsearcher.models import JobPosting, WorkMode
 from jobsearcher.scoring.llm import (
     BudgetExhaustedError,
+    LlmConfigError,
     LlmScorer,
     LlmScoringError,
     _extract_json_object,
@@ -123,7 +124,9 @@ def _scorer(client: _FakeClient, **config: Any) -> LlmScorer:
 
 
 def test_missing_api_key_raises_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    with pytest.raises(LlmScoringError, match=_KEY_ENV):
+    # A config failure under the scorer contract, so the pipeline reports it
+    # instead of letting a traceback out mid-run.
+    with pytest.raises(LlmConfigError, match=_KEY_ENV):
         _scorer(_FakeClient())
 
 
@@ -138,7 +141,7 @@ def test_api_key_is_read_from_the_environment_not_config(monkeypatch: pytest.Mon
 
 def test_putting_an_api_key_in_config_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     _with_key(monkeypatch)
-    with pytest.raises(ValueError, match=r"[Ii]nvalid"):
+    with pytest.raises(LlmConfigError, match=r"[Ii]nvalid"):
         _scorer(_FakeClient(), api_key="sk-in-config")
 
 
@@ -329,7 +332,7 @@ def test_the_old_budget_key_explains_the_rename_and_the_new_meaning(
     """ "Extra inputs are not permitted" is true and useless here."""
     _with_key(monkeypatch)
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(LlmConfigError) as excinfo:
         _scorer(_FakeClient(), max_postings_per_run=25)
 
     message = str(excinfo.value)
