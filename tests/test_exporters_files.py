@@ -143,7 +143,7 @@ def test_csv_with_no_postings_still_writes_a_header(tmp_path: Path) -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     assert lines == [
         "score,title,company,source,status,work_mode,location,"
-        "eligible_locations,url,published_at,salary_text,summary,"
+        "eligible_locations,detected_language,url,published_at,salary_text,summary,"
         "matched_skills,missing_requirements,penalized_skills"
     ]
 
@@ -176,6 +176,31 @@ def test_json_keeps_lists_as_lists_and_dates_as_iso_strings(tmp_path: Path) -> N
     assert record["eligible_locations"] == ["EU", "Germany"]
     assert record["published_at"] == "2026-02-03T09:30:00+00:00"
     assert record["score"] == 70
+
+
+def test_json_and_csv_expose_detected_language(tmp_path: Path) -> None:
+    """The language filter reads `detected_language`; an export must carry it
+    so its own output can be filtered the same way."""
+    json_path = tmp_path / "jobs.json"
+    csv_path = tmp_path / "jobs.csv"
+    postings = [
+        _posting(url="https://example.com/jobs/en", detected_language="en"),
+        _posting(url="https://example.com/jobs/undetermined", detected_language=None),
+    ]
+
+    JsonExporter().export(postings, _opts(output_path=str(json_path)))
+    CsvExporter().export(postings, _opts(output_path=str(csv_path)))
+
+    records = json.loads(json_path.read_text(encoding="utf-8"))["postings"]
+    assert {r["url"].rsplit("/", 1)[1]: r["detected_language"] for r in records} == {
+        "en": "en",
+        "undetermined": None,
+    }
+    rows = list(csv.DictReader(csv_path.read_text(encoding="utf-8").splitlines()))
+    assert {row["url"].rsplit("/", 1)[1]: row["detected_language"] for row in rows} == {
+        "en": "en",
+        "undetermined": "",
+    }
 
 
 def test_json_unscored_posting_has_null_score(tmp_path: Path) -> None:
@@ -292,10 +317,24 @@ def test_unknown_option_is_rejected(exporter: Any, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("exporter", [CsvExporter(), JsonExporter(), MarkdownExporter()])
+def test_missing_parent_directories_are_created(exporter: Any, tmp_path: Path) -> None:
+    nested = tmp_path / "out" / "2026-09" / "jobs.out"
+    result = exporter.export([_posting(score=1)], _opts(output_path=str(nested)))
+
+    assert nested.is_file()
+    assert nested.read_text(encoding="utf-8")
+    assert result.exported == 1
+
+
+@pytest.mark.parametrize("exporter", [CsvExporter(), JsonExporter(), MarkdownExporter()])
 def test_unwritable_path_is_wrapped_in_an_exporter_error(exporter: Any, tmp_path: Path) -> None:
-    missing_dir = tmp_path / "does-not-exist" / "jobs.out"
+    # A parent path segment that is a regular file, not a directory: the
+    # exporter cannot create the directory chain under it, and that failure
+    # must still surface as an ExporterError rather than a raw OSError.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file", encoding="utf-8")
     with pytest.raises(ExporterError, match=r"could not write to"):
-        exporter.export([_posting()], _opts(output_path=str(missing_dir)))
+        exporter.export([_posting()], _opts(output_path=str(blocker / "sub" / "jobs.out")))
 
 
 def test_exporters_do_not_use_the_stdlib_csv_default_line_ending(tmp_path: Path) -> None:

@@ -55,6 +55,22 @@ def _feed_handler_for(xml_text: str) -> Any:
     return handler
 
 
+def _feed_with_items(count: int, *, pubdate: str = "Wed, 15 Jul 2026 10:00:00 +0000") -> str:
+    """A well-formed feed of `count` distinct, valid items."""
+    items = "".join(
+        f"<item><title>Corp{i}: Engineer {i}</title>"
+        f"<link>https://weworkremotely.com/remote-jobs/job-{i}</link>"
+        f"<pubDate>{pubdate}</pubDate>"
+        "<description><![CDATA[short summary]]></description>"
+        "<region>Anywhere in the World</region></item>"
+        for i in range(count)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<rss version="2.0"><channel><title>WWR</title>{items}</channel></rss>'
+    )
+
+
 def test_fetch_yields_valid_items_and_skips_the_malformed_ones() -> None:
     source = _source(_main_feed_handler)
 
@@ -258,6 +274,56 @@ def test_fetch_full_description_falls_back_when_container_not_found() -> None:
 
     examplecorp = next(p for p in postings if p.company == "ExampleCorp")
     assert "We build the platform" in examplecorp.description_clean
+
+
+def test_a_systematic_detail_fetch_failure_logs_once_then_tallies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every detail page 403ing must not print one warning per posting."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith(".rss"):
+            return httpx.Response(200, text=_feed_with_items(5))
+        return httpx.Response(403)
+
+    source = _source(handler, fetch_full_description=True)
+
+    with caplog.at_level(logging.WARNING):
+        postings = list(source.fetch())
+
+    assert len(postings) == 5
+    assert all("short summary" in (p.description_clean or "") for p in postings)
+
+    messages = [record.getMessage() for record in caplog.records]
+    detailed = [m for m in messages if "could not fetch the full description" in m]
+    tally = [m for m in messages if "full-description fetches failed" in m]
+    assert len(detailed) == 1
+    assert tally == [
+        "Source 'weworkremotely': 5 full-description fetches failed, "
+        "kept the RSS summaries (fetch_full_description is off by default "
+        "for this reason)"
+    ]
+
+
+def test_a_feed_wide_unparsable_pubdate_logs_once_then_tallies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = _source(_feed_handler_for(_feed_with_items(4, pubdate="not a date")))
+
+    with caplog.at_level(logging.WARNING):
+        postings = list(source.fetch())
+
+    assert len(postings) == 4
+    assert all(p.published_at is None for p in postings)
+
+    messages = [record.getMessage() for record in caplog.records]
+    first = [m for m in messages if "could not parse the pubDate 'not a date'" in m]
+    tally = [m for m in messages if "unparsable pubDate and were kept" in m]
+    assert len(first) == 1
+    assert tally == [
+        "Source 'weworkremotely': 4 postings had an unparsable pubDate "
+        "and were kept without a published date"
+    ]
 
 
 def test_unknown_config_key_is_rejected_at_construction() -> None:

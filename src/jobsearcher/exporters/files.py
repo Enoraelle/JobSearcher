@@ -4,7 +4,8 @@ These three use only the standard library. They share
 one option, ``output_path`` (where to write), and one ordering rule: postings come
 out sorted by score, highest first, with unscored postings last. That order
 is the point of an export (you read the top of the list first), so it is
-applied to every format, not just the human-readable one.
+applied to every format, not just the human-readable one. Missing parent
+directories in ``output_path`` are created on write (see :func:`_write_text`).
 
 - **CSV** (:class:`CsvExporter`): one row per posting, a fixed column set,
   list-valued fields joined with ``"; "`` so every cell is a scalar. For
@@ -47,6 +48,7 @@ _FIELD_NAMES: tuple[str, ...] = (
     "work_mode",
     "location",
     "eligible_locations",
+    "detected_language",
     "url",
     "published_at",
     "salary_text",
@@ -185,6 +187,11 @@ def _record(posting: JobPosting, *, flatten: bool) -> dict[str, Any]:
         "work_mode": posting.work_mode.value,
         "location": posting.location,
         "eligible_locations": list(posting.eligible_locations),
+        # Blank when the language heuristic could not decide (see
+        # `JobPosting.detected_language`); the language filter that `list`,
+        # `export` and `run` share reads this same field, so an export that
+        # omitted it could not be reproduced from its own output.
+        "detected_language": posting.detected_language,
         "url": posting.url,
         "published_at": published_at,
         "salary_text": posting.salary_text,
@@ -202,6 +209,11 @@ def _record(posting: JobPosting, *, flatten: bool) -> dict[str, Any]:
 
 def _write_text(path: Path, text: str) -> None:
     try:
+        # An `output_path` in a not-yet-existing subdirectory
+        # (`out/2026-09/jobs.json`) is a reasonable thing to configure; create
+        # the parent chain rather than failing with `FileNotFoundError`. For a
+        # bare filename `path.parent` is `.`, and the call is a no-op.
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
         raise ExporterError(f"could not write to {path}: {exc}") from exc

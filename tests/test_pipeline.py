@@ -322,9 +322,9 @@ def test_posting_filters_select_respects_remote(storage: SqliteStorage) -> None:
 class _ExplodingSource(Source):
     """A source that raises something other than a SourceError mid-stream.
 
-    This is what selector drift actually looks like: bs4 hands back None and
-    the next attribute access raises AttributeError. `Source.fetch` isolates
-    `SourceError` only, so nothing below it catches this.
+    This is what an unhandled parsing bug looks like: a helper hands back
+    None and the next attribute access raises AttributeError. `Source.fetch`
+    isolates `SourceError` only, so nothing below it catches this.
     """
 
     def fetch_raw(self) -> Iterator[dict[str, Any]]:
@@ -366,9 +366,9 @@ def test_an_unexpected_exception_in_one_source_does_not_abort_the_others(
 ) -> None:
     """The policy in sources/base.py is only real if the pipeline enforces it.
 
-    `Source.fetch` catches SourceError. Anything else - a TypeError, a bs4
-    AttributeError - walks straight out of the fetch phase and costs every
-    source that had not run yet.
+    `Source.fetch` catches SourceError. Anything else - a TypeError, an
+    AttributeError from a parsing bug - walks straight out of the fetch
+    phase and costs every source that had not run yet.
     """
     config = _make_config(
         sources={

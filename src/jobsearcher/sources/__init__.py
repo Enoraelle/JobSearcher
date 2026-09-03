@@ -6,6 +6,5 @@ source by name via `jobsearcher.sources.base.get_source_class` should
 import `jobsearcher.sources` first so the registration side effect runs.
 """
 
-from jobsearcher.sources import freework as freework
 from jobsearcher.sources import greenhouse as greenhouse
 from jobsearcher.sources import weworkremotely as weworkremotely

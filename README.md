@@ -228,10 +228,6 @@ sources:
   greenhouse:
     enabled: false
     companies: [example-company]
-  freework:
-    enabled: false
-    keywords: ["python django", "développeur backend"]
-    max_postings_per_keyword: 50
 
 storage:
   backend: sqlite
@@ -269,7 +265,15 @@ writes.
 | ---------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `weworkremotely` | RSS feeds — the site-wide `remote-jobs` feed and per-category feeds (`feeds:` list). | Remote-only jobs listed on We Work Remotely. Enabled by default; needs no configuration. RSS descriptions are truncated unless `fetch_full_description: true`. |
 | `greenhouse`     | JSON API — one request per company slug against the public Greenhouse Job Board API (`companies:` list). | Postings on the Greenhouse-hosted board of each company you name. You choose the companies; nothing is discovered automatically. |
-| `freework`       | HTML scrape — one search request per keyword against free-work.com's tech/IT job search (`keywords:` list). | French freelance / contract ("mission") postings. Fragile: free-work.com publishes no API, so a redesign can break it (see [Limitations](#limitations)). |
+
+A `freework` source (an HTML scrape of free-work.com) shipped in earlier
+versions and was removed: free-work.com's [terms of
+use](https://www.free-work.com/fr/terms) reserve its API and forbid
+extracting a substantial part of its database. That prohibition is about the
+extraction, not the means — the HTML scraper fell under it as much as an API
+client would — so keeping it in a public repository was not defensible. See
+the git history (`git log -- src/jobsearcher/sources/freework.py`) for the
+old implementation.
 
 Adding a source is a single new file and no change to existing ones — see
 [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -315,9 +319,34 @@ scoring:
   max_description_chars: 4000             # how much of each description to send
 ```
 
+Set the variable named by `api_key_env` in the shell you run `jobsearcher`
+from. JobSearcher does not read a `.env` file, and will not grow that
+feature — the key lives in your shell (or your OS keychain / CI secret
+store), not in a file next to the code. Set it with your shell's own
+command:
+
 ```bash
-export OPENAI_API_KEY=sk-...   # the variable named by api_key_env
+# bash / zsh (Linux, macOS)
+export OPENAI_API_KEY=sk-...
 jobsearcher score
+```
+
+```powershell
+# PowerShell (Windows) — session only
+$env:OPENAI_API_KEY = "sk-..."
+jobsearcher score
+
+# PowerShell — persist for future sessions (current user)
+[Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "sk-...", "User")
+```
+
+```bat
+:: cmd.exe (Windows) — session only
+set OPENAI_API_KEY=sk-...
+jobsearcher score
+
+:: cmd.exe — persist for future sessions (current user)
+setx OPENAI_API_KEY sk-...
 ```
 
 The API key is only ever read from the environment variable named by
@@ -422,19 +451,17 @@ score is never silently clobbered by a rescrape.
 
 ## Limitations
 
-- **HTML scrapers break when the site's layout changes.** `freework`, and
-  We Work Remotely's `fetch_full_description` option, depend on the pages'
-  markup, which no site owes a scraper. When a layout changes, `freework`
-  fails with a message that says the layout has probably changed (rather
-  than a stack trace), and `fetch_full_description` quietly falls back to
-  the truncated RSS description. Expect to update selectors periodically.
-- **`freework` reads only the first page of results per keyword.** It sends
-  one search request per entry in `keywords:` and does not follow
-  free-work.com's pagination, so anything that does not fit on the first
-  results page is never collected. `max_postings_per_keyword` only lowers
-  that ceiling — it cannot see past the first page, and setting it higher
-  than a page holds has no effect. Collect more by adding narrower
-  keywords, not by raising the limit.
+- **HTML scrapers break when the site's layout changes.** We Work
+  Remotely's `fetch_full_description` option depends on the detail page's
+  markup, which no site owes a scraper. When the layout changes it quietly
+  falls back to the truncated RSS description rather than failing.
+- **We Work Remotely refuses `fetch_full_description` detail requests.**
+  The per-posting detail pages return HTTP 403 to JobSearcher's identifiable
+  User-Agent. The option is therefore off by default and left off: it costs
+  one refused request per posting and never yields a fuller description.
+  JobSearcher does not disguise its User-Agent to get around the refusal —
+  the site is entitled to say no. If you enable the option anyway, nothing
+  breaks (the truncated RSS summary is kept), but you gain nothing either.
 - **RSS feeds are parsed with the standard library's XML parser.**
   `xml.etree.ElementTree` does not resolve external entities, so a feed
   cannot make JobSearcher fetch a URL or read a local file. It offers no

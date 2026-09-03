@@ -13,7 +13,12 @@ run. Failures are isolated at three levels:
 
 - Item-level: `normalize()` raises `KeyError`, `ValueError`, or
   `pydantic.ValidationError` for one malformed raw item. `fetch()` catches
-  it, logs a warning, counts it as skipped, and moves on to the next item.
+  it, counts it as skipped, and moves on to the next item. It logs the
+  first such failure of each kind in full and then only tallies the rest
+  (see `_record_repeated`), so a feed that broke the same way on every item
+  does not bury the run in identical warnings. The same helper is available
+  to subclasses for any other per-item failure that can repeat — a detail
+  page that 404s for every posting, an unparsable date on every item.
 - Unit-level: many sources fetch from several independent sub-units in one
   run (Greenhouse fetches one board per configured company slug; a realistic
   config lists ten to seventy of them). One bad unit — a misspelled slug, a
@@ -204,6 +209,29 @@ class SourceRunStats:
         return self.yielded == 0 and bool(self.errors)
 
 
+@dataclass
+class _RepeatingCondition:
+    """Running tally for a per-item failure that tends to recur identically.
+
+    Some failures happen once per posting and the same way every time: a
+    source that fetches a detail page per posting against a server that
+    refuses them, or one normalizing a feed whose date format just changed.
+    One log line per item then buries the rest of the run. `_record_repeated`
+    logs the first occurrence of each `key` in full and only counts the
+    others; `_log_repeated_summaries`, called once `fetch()` is done, emits a
+    single tally line per key that recurred.
+
+    Attributes:
+        summary: The end-of-run line, logged only if the condition recurred.
+            ``{count}`` in it is replaced with the total number of
+            occurrences.
+        count: How many times the condition has been recorded this run.
+    """
+
+    summary: str
+    count: int = 0
+
+
 _SourceT = TypeVar("_SourceT", bound="Source")
 _REGISTRY: dict[str, type[Source]] = {}
 
@@ -336,6 +364,7 @@ class Source(ABC):
         self.name = name
         self.config = config
         self.last_run: SourceRunStats = SourceRunStats()
+        self._repeated: dict[str, _RepeatingCondition] = {}
 
         policy = read_http_policy(name, config)
         self._max_retries = policy.max_retries if max_retries is None else max_retries
@@ -413,13 +442,24 @@ class Source(ABC):
             Successfully normalized postings.
         """
         self.last_run = SourceRunStats()
+        self._repeated = {}
         try:
             for raw in self.fetch_raw():
                 try:
                     posting = self.normalize(raw)
                 except (KeyError, ValueError, ValidationError) as exc:
                     self.last_run.skipped += 1
-                    logger.warning("Source %r: skipping a malformed posting (%s)", self.name, exc)
+                    # Grouped by exception type so a feed that broke the same
+                    # way on every item logs once and tallies, while a
+                    # genuinely different malformation still gets its own line.
+                    self._record_repeated(
+                        f"malformed-item:{type(exc).__name__}",
+                        first_message=f"skipping a malformed posting ({exc})",
+                        summary=(
+                            "skipped {count} malformed postings of the same kind "
+                            f"({type(exc).__name__})"
+                        ),
+                    )
                     continue
                 # Language tagging happens here, once, rather than in every
                 # source's normalize(): it is the same heuristic for all of
@@ -446,6 +486,43 @@ class Source(ABC):
                     self.last_run.yielded,
                     exc,
                 )
+        finally:
+            # Runs on normal exhaustion and on an early `close()` alike, so a
+            # partial run still gets its tally of any per-item condition that
+            # repeated (see `_record_repeated`).
+            self._log_repeated_summaries()
+
+    def _record_repeated(self, key: str, *, first_message: str, summary: str) -> None:
+        """Note one occurrence of a per-item condition that tends to recur.
+
+        The first occurrence of each ``key`` this run is logged at WARNING
+        with ``first_message``; every later one only increments a counter. If
+        the key recurred, `_log_repeated_summaries` (called at the end of
+        `fetch()`) logs ``summary`` once, with ``{count}`` replaced by the
+        total. This keeps a systematic failure — every detail page returning
+        403, say — to one detailed line plus one tally, instead of one line
+        per posting drowning the rest of the run.
+
+        Args:
+            key: Groups occurrences counted together. Use a distinct key per
+                distinct failure so their tallies stay separate.
+            first_message: The full message for the first occurrence. It
+                should say what failed and what was kept instead.
+            summary: The end-of-run tally line. ``{count}`` is substituted
+                with the number of occurrences.
+        """
+        entry = self._repeated.get(key)
+        if entry is None:
+            entry = self._repeated[key] = _RepeatingCondition(summary=summary)
+        entry.count += 1
+        if entry.count == 1:
+            logger.warning("Source %r: %s", self.name, first_message)
+
+    def _log_repeated_summaries(self) -> None:
+        """Emit one tally line for every per-item condition that recurred."""
+        for entry in self._repeated.values():
+            if entry.count > 1:
+                logger.warning("Source %r: %s", self.name, entry.summary.format(count=entry.count))
 
     def _record_error(self, message: str) -> None:
         """Log and record a unit-level failure on `last_run`, without raising.

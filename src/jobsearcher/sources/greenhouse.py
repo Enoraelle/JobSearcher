@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import html
 import json
-import logging
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -51,8 +50,6 @@ from jobsearcher.sources.base import (
     SourceUnavailableError,
     register_source,
 )
-
-logger = logging.getLogger(__name__)
 
 _JOB_BOARD_URL: Final[str] = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
 
@@ -152,7 +149,7 @@ def _extract_eligible_locations(location_name: str | None, description_clean: st
     return found
 
 
-def _parse_datetime(value: Any) -> datetime | None:
+def _parse_datetime(value: Any, *, source: Source) -> datetime | None:
     """Parse a Greenhouse timestamp into a UTC-aware datetime.
 
     `JobPosting` requires timezone-aware datetimes, and a naive one raises —
@@ -164,10 +161,15 @@ def _parse_datetime(value: Any) -> datetime | None:
 
     Args:
         value: The raw `updated_at` field, of whatever type the API sent.
+        source: The source doing the parsing. An unparsable value is
+            reported through `Source._record_repeated`, so a board that
+            changed its timestamp format logs the first one in full and then
+            only tallies the rest rather than warning once per posting.
 
     Returns:
         The timestamp in UTC, or `None` if there is none to read, or `None`
-        with a logged warning if there was one and it could not be read.
+        (with the failure reported) if there was one and it could not be
+        read.
     """
     if not isinstance(value, str) or not value:
         # No timestamp at all is ordinary: an optional field, nothing to say.
@@ -178,10 +180,16 @@ def _parse_datetime(value: Any) -> datetime | None:
         # A value that is there and unreadable is not ordinary. Returning
         # None in silence leaves a posting with no date and no trace of why,
         # which is unresearchable the day the API changes its format.
-        logger.warning(
-            "Greenhouse: could not parse the timestamp %r; the posting is kept "
-            "without a published date.",
-            value,
+        source._record_repeated(
+            "greenhouse-unparsable-timestamp",
+            first_message=(
+                f"could not parse the updated_at timestamp {value!r}; the posting "
+                "is kept without a published date"
+            ),
+            summary=(
+                "{count} postings had an unparsable updated_at timestamp and "
+                "were kept without a published date"
+            ),
         )
         return None
     if parsed.tzinfo is None:
@@ -300,7 +308,7 @@ class GreenhouseSource(Source):
             description_clean=description_clean,
             location=location_name,
             work_mode=infer_work_mode(location_name, description_clean),
-            published_at=_parse_datetime(raw.get("updated_at")),
+            published_at=_parse_datetime(raw.get("updated_at"), source=self),
             fetched_at=datetime.now(UTC),
             eligible_locations=_extract_eligible_locations(location_name, description_clean),
         )

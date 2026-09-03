@@ -93,20 +93,42 @@ imports.
   malformed *item* (it catches only `KeyError`/`ValueError`/
   `ValidationError` and counts `skipped`), and the per-unit error isolation
   in `fetch_raw` never sees these requests, so a detail-page failure is
-  only logged — it reaches neither `skipped` nor `last_run.errors`, and a
-  posting silently degraded to its truncated description counts as a clean
-  success. Rate limiting is affected the same way: `min_request_interval`
+  logged once and then tallied (`_fetch_full_description` routes it through
+  `Source._record_repeated`) — it reaches neither `skipped` nor
+  `last_run.errors`, and a posting silently degraded to its truncated
+  description counts as a clean success. Rate limiting is affected the same
+  way: `min_request_interval`
   is the source's single global spacing, sized in every other source for
   one request per unit, which is why this source's docstring has to tell
   whoever enables the option to set it in the same config block (it is one
   of the shared options in `SourceHttpConfig`, applied by `Source.__init__`
   from the source's own configuration). Deliberate for v1 (the
-  fan-out is opt-in and degrades rather than fails), and no code change is
-  proposed here — but anyone reasoning about item counts, recorded errors,
-  or request pacing should know `normalize` is not side-effect-free.
+  fan-out is opt-in and degrades rather than fails), and no change to the
+  two-phase-fetch question is proposed here — but anyone reasoning about
+  item counts, recorded errors, or request pacing should know `normalize`
+  is not side-effect-free.
   Revisit alongside a decision on where a two-phase fetch (list, then
   detail) belongs: most plausibly in `fetch_raw`, which already owns unit
   boundaries and error recording.
+
+- **Green tests have three times protected a defect instead of revealing
+  it.** (1) The Greenhouse fixture did not reproduce the API's
+  HTML-*escaped* `content`, so the tests passed while every real
+  description shipped full of literal `<p>` tags. (2) A test of
+  `SourceRunStats.failed` passed by coincidence — the value it asserted
+  happened to equal the field's default, so the assertion held even when
+  the logic behind it did not. (3) `test_unwritable_path_is_wrapped_in_an_exporter_error`
+  asserted that a missing parent directory *must* raise, freezing a
+  `FileNotFoundError` that should always have been a `mkdir`. Each was
+  written after the code and against a run that was already green.
+
+  The rule: **a test written after the code describes what the code does,
+  not what it should do.** Any test added for already-existing behaviour
+  must be verified by deliberately breaking it — invert the assertion, or
+  revert the code under test — and seeing it fail for the stated reason
+  before it is kept. A test that has never been red has not been shown to
+  test anything. (New behaviour written test-first is already covered by
+  this, since its test starts red by construction.)
 
 ## Absolute rules
 

@@ -1,19 +1,19 @@
 """Shared inference of a posting's work arrangement from its free text.
 
-No job board this package reads exposes a structured remote/hybrid flag, so
-every source has to read the arrangement out of prose. That is one problem
-with one correct answer, and it lived here as two: a careful version in
-``greenhouse.py`` and an eight-line substring test in ``freework.py`` that
-read "This role is not remote" as REMOTE and matched "remote" inside
-"Remotely-Managed Ltd". Copying the good one into the second module would
+A job board that exposes a structured remote/hybrid flag should use it
+directly; this module is for the boards that do not, where the arrangement
+has to be read out of prose. That is one problem with one correct answer,
+and it once lived as two: a careful version and an eight-line substring test
+that read "This role is not remote" as REMOTE and matched "remote" inside
+"Remotely-Managed Ltd". Merging the good one into the second place would
 have fixed the symptom and rebuilt the cause — two copies diverge again, and
 the next source makes three.
 
 What is shared here is the *mechanism*; the vocabulary stays with the
-source. Free-work.com's postings say "Télétravail total" and We Work
-Remotely's say nothing at all, so each caller passes the markers its site
-uses (see ``remote_markers`` / ``hybrid_markers``) and gets the same reading
-rules applied to them.
+source. A French-language board says "Télétravail total" where an
+English-language one says "fully remote", and some say nothing structured at
+all, so each caller passes the markers its site uses (see ``remote_markers``
+/ ``hybrid_markers``) and gets the same reading rules applied to them.
 
 Two rules make the difference, and both are why a substring test is not
 enough:

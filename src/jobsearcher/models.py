@@ -144,8 +144,7 @@ class JobPosting(BaseModel):
     # --- Content ---
     # `description_raw` is the posting body exactly as its source delivers
     # it, and what that *is* differs by source: HTML markup from Greenhouse
-    # (unescaped once, see `_description_html`) and from We Work Remotely,
-    # plain text from free-work.com, whose search cards carry no markup.
+    # (unescaped once, see `_description_html`) and from We Work Remotely.
     # Nothing normalizes it, on purpose — it is the field to look at when a
     # source starts emitting something unexpected, so it must stay
     # untouched. A consumer that wants text must therefore read

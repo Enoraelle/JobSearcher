@@ -120,6 +120,48 @@ def test_fetch_leaves_failed_false_on_a_partial_unit_failure() -> None:
     assert source.last_run.failed is False
 
 
+def test_a_feed_wide_malformation_logs_once_then_tallies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every item failing normalize the same way must not flood the log."""
+    source = _DummySource([{"bad": True} for _ in range(6)])
+
+    with caplog.at_level("WARNING"):
+        postings = list(source.fetch())
+
+    assert postings == []
+    assert source.last_run.skipped == 6
+
+    messages = [record.getMessage() for record in caplog.records]
+    first = [m for m in messages if "skipping a malformed posting" in m]
+    tally = [m for m in messages if "malformed postings of the same kind" in m]
+    assert len(first) == 1
+    assert tally == ["Source 'dummy': skipped 6 malformed postings of the same kind (ValueError)"]
+
+
+def test_repeated_conditions_are_summarized_on_an_early_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The end-of-run tally still fires when a caller stops iterating early."""
+    source = _DummySource(
+        [
+            {"bad": True},
+            {"bad": True},
+            {"url": "https://example.test/jobs/1"},
+            {"bad": True},
+        ]
+    )
+
+    with caplog.at_level("WARNING"):
+        gen = source.fetch()
+        next(gen)  # two malformed items recorded, then the first posting yielded
+        gen.close()  # stop before the rest
+
+    messages = [r.getMessage() for r in caplog.records]
+    tally = [m for m in messages if "malformed postings of the same kind" in m]
+    assert tally == ["Source 'dummy': skipped 2 malformed postings of the same kind (ValueError)"]
+
+
 def test_fetch_resets_last_run_on_each_call() -> None:
     source = _DummySource([{"bad": True}])
     list(source.fetch())

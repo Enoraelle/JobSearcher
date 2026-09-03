@@ -18,23 +18,39 @@ next feed rather than aborting the rest of the list.
 The RSS `<description>` is truncated by We Work Remotely itself, not by this
 source. `fetch_full_description` (off by default) makes normalize() issue
 one extra GET per posting, to the posting's own page, and scrape the full
-description out of it. This is opt-in because it turns O(feeds) requests
-into O(postings) requests — a full category page lists dozens of jobs — and
-because it depends on the page's HTML structure rather than a stable API, so
-it is expected to degrade rather than fail: if the detail page is
-unreachable or its markup doesn't match `_DETAIL_DESCRIPTION_CONTAINER_CLASS`
-anymore, `_fetch_full_description` logs a warning and returns `None`, and
-`normalize` simply keeps the truncated RSS description instead of raising.
-Anyone enabling `fetch_full_description` should also set a non-zero
-`min_request_interval` in the same `sources.weworkremotely` block — one of
-the shared options in `SourceHttpConfig`, which the pipeline passes on —
-since that is what paces the resulting one-request-per-posting fan-out;
-this source does not add a second, separate rate limiter on top of it.
+description out of it.
+
+**We Work Remotely refuses these detail requests.** As of 2026 the
+per-posting pages return HTTP 403 to JobSearcher's identifiable User-Agent,
+every time — the RSS feed itself is served normally, only the detail pages
+are blocked. The option is therefore off by default and documented as not
+worth turning on: each posting costs one refused request and gains nothing.
+JobSearcher deliberately does **not** work around the 403 — it will not
+disguise its User-Agent as a browser to get past a site that is entitled to
+say no, and the project's choice of an identifiable agent (see
+`base.USER_AGENT`) is the opposite of that. If you enable the option
+anyway, nothing breaks: `_fetch_full_description` records the failure and
+returns `None`, and `normalize` keeps the truncated RSS description.
+
+Beyond the 403, the option is also opt-in because it turns O(feeds)
+requests into O(postings) requests — a full category page lists dozens of
+jobs — and because it depends on the page's HTML structure rather than a
+stable API, so it degrades rather than fails: if the markup no longer
+matches `_DETAIL_DESCRIPTION_CONTAINER_CLASS`, the RSS description is kept
+just the same. Because the failure is systematic, `_fetch_full_description`
+logs the first occurrence in full and then only tallies the rest through
+`Source._record_repeated`, ending the run with one line like
+``"45 full-description fetches failed, kept the RSS summaries"`` rather than
+45 identical warnings. Anyone enabling `fetch_full_description` should also
+set a non-zero `min_request_interval` in the same `sources.weworkremotely`
+block — one of the shared options in `SourceHttpConfig`, which the pipeline
+passes on — since that is what paces the resulting one-request-per-posting
+fan-out; this source does not add a second, separate rate limiter on top of
+it.
 """
 
 from __future__ import annotations
 
-import logging
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -55,8 +71,6 @@ from jobsearcher.sources.base import (
     SourceUnavailableError,
     register_source,
 )
-
-logger = logging.getLogger(__name__)
 
 _MAIN_FEED_NAME: Final[str] = "remote-jobs"
 _MAIN_FEED_URL: Final[str] = "https://weworkremotely.com/remote-jobs.rss"
@@ -210,27 +224,36 @@ def _split_company_and_title(title: str) -> tuple[str, str] | None:
     return company, job_title
 
 
-def _parse_rfc822(value: str | None) -> datetime | None:
+def _parse_rfc822(value: str | None, *, source: Source) -> datetime | None:
     """Parse an RSS `pubDate` (RFC 822) into a UTC-aware datetime.
 
     Args:
         value: The item's `pubDate`, or `None` if it carries none.
+        source: The source doing the parsing. An unparsable value is
+            reported through `Source._record_repeated`, so a feed that
+            changed its date format logs the first one in full and then
+            only tallies the rest rather than warning once per item.
 
     Returns:
         The timestamp in UTC, or `None` if there is none to read, or `None`
-        with a logged warning if there was one and it could not be read —
-        a posting silently losing its date leaves nothing to investigate
-        with the day the feed changes format.
+        (with the failure reported) if there was one and it could not be
+        read — a posting silently losing its date leaves nothing to
+        investigate with the day the feed changes format.
     """
     if not value:
         return None
     try:
         parsed = parsedate_to_datetime(value)
     except (TypeError, ValueError):
-        logger.warning(
-            "We Work Remotely: could not parse the pubDate %r; the posting is kept "
-            "without a published date.",
-            value,
+        source._record_repeated(
+            "wwr-unparsable-pubdate",
+            first_message=(
+                f"could not parse the pubDate {value!r}; the posting is kept "
+                "without a published date"
+            ),
+            summary=(
+                "{count} postings had an unparsable pubDate and were kept without a published date"
+            ),
         )
         return None
     if parsed.tzinfo is None:
@@ -365,7 +388,7 @@ class WeWorkRemotelySource(Source):
             description_clean=description_clean,
             location=region or None,
             work_mode=WorkMode.REMOTE,
-            published_at=_parse_rfc822(raw.get("pubDate")),
+            published_at=_parse_rfc822(raw.get("pubDate"), source=self),
             fetched_at=datetime.now(UTC),
             eligible_locations=_eligible_locations_from_region(region),
         )
@@ -373,30 +396,45 @@ class WeWorkRemotelySource(Source):
     def _fetch_full_description(self, url: str) -> str | None:
         """Best-effort fetch of a posting's full description from its page.
 
-        Returns `None` (rather than raising) on any failure — a transient
-        network issue, or the page no longer having a
-        `_DETAIL_DESCRIPTION_CONTAINER_CLASS` container — so `normalize` can
-        fall back to the RSS-supplied truncated description instead of
-        losing the posting entirely.
+        Returns `None` (rather than raising) on any failure — the near-certain
+        403 (see the module docstring), a transient network issue, or the
+        page no longer having a `_DETAIL_DESCRIPTION_CONTAINER_CLASS`
+        container — so `normalize` can fall back to the RSS-supplied
+        truncated description instead of losing the posting entirely. Each
+        failure mode is reported through `Source._record_repeated`: the first
+        is logged in full, the rest are tallied into one end-of-run line.
         """
         try:
             response = self._request("GET", url)
         except SourceError as exc:
-            logger.warning(
-                "We Work Remotely: could not fetch the full description from %s (%s); "
-                "keeping the RSS summary",
-                url,
-                exc,
+            self._record_repeated(
+                "wwr-detail-fetch-failed",
+                first_message=(
+                    f"could not fetch the full description from {url} ({exc}); "
+                    "keeping the RSS summary. We Work Remotely returns 403 for "
+                    "detail-page requests — this is why fetch_full_description is "
+                    "off by default (see the module docstring)."
+                ),
+                summary=(
+                    "{count} full-description fetches failed, kept the RSS summaries "
+                    "(fetch_full_description is off by default for this reason)"
+                ),
             )
             return None
 
         html_content = _extract_listing_container_html(response.text)
         if html_content is None:
-            logger.warning(
-                "We Work Remotely: could not find a %r container at %s "
-                "(the page layout may have changed); keeping the RSS summary",
-                _DETAIL_DESCRIPTION_CONTAINER_CLASS,
-                url,
+            self._record_repeated(
+                "wwr-detail-container-missing",
+                first_message=(
+                    f"could not find a {_DETAIL_DESCRIPTION_CONTAINER_CLASS!r} container "
+                    f"at {url} (the page layout may have changed); keeping the RSS summary"
+                ),
+                summary=(
+                    "{count} detail pages had no "
+                    f"{_DETAIL_DESCRIPTION_CONTAINER_CLASS!r} container "
+                    "(the page layout may have changed); kept the RSS summaries"
+                ),
             )
             return None
         return html_content

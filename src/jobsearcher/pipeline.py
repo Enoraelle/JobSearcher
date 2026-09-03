@@ -294,8 +294,8 @@ class Pipeline:
                     if limit is not None and kept >= limit:
                         break
             except Exception as exc:
-                # `Source.fetch` isolates `SourceError`; everything else — a
-                # bs4 `AttributeError` on drifted markup, a `TypeError` on an
+                # `Source.fetch` isolates `SourceError`; everything else — an
+                # `AttributeError` on drifted markup, a `TypeError` on an
                 # unexpected payload shape — would otherwise walk out of this
                 # method and cost every source that has not run yet. The
                 # policy stated in sources/base.py only holds if the layer

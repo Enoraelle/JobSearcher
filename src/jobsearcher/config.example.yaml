@@ -70,12 +70,14 @@ sources:
     feeds:
       - remote-jobs
       - remote-programming-jobs
-    # Off by default: fetching every posting's own page (one extra request
-    # per posting, on top of the feed requests) to get its full description
-    # instead of the RSS feed's truncated one. Turning it on turns a handful
-    # of requests into one per posting, so set `min_request_interval` below
-    # to at least 1.0 before you do - it is what spaces them out, and
-    # without it the whole feed is hammered at full speed.
+    # Off by default, and best left off: We Work Remotely returns HTTP 403
+    # for every per-posting detail page, so turning this on costs one
+    # refused request per posting and never yields a fuller description
+    # (the truncated RSS summary is kept either way). JobSearcher will not
+    # disguise its User-Agent to get past that refusal. If the block were
+    # ever unblocked, this also turns a handful of feed requests into one
+    # per posting, so set `min_request_interval` to at least 1.0 before
+    # enabling it - that is what spaces the fan-out out.
     fetch_full_description: false
     min_request_interval: 0.0
     max_postings_per_feed: 50
@@ -89,19 +91,6 @@ sources:
     enabled: false
     companies:
       - example-company
-
-  # HTML-scraping source (see sources/freework.py). One search request per
-  # configured keyword against free-work.com's tech/IT job search. This is
-  # the fragile shape: free-work.com publishes no API contract, so a site
-  # redesign can break the selectors this source depends on — see that
-  # module's docstring for how such a failure is surfaced. Disabled by
-  # default.
-  freework:
-    enabled: false
-    keywords:
-      - "python django"
-      - "développeur backend"
-    max_postings_per_keyword: 50
 
 storage:
   backend: sqlite

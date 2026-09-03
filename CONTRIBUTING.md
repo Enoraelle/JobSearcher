@@ -76,14 +76,13 @@ circular imports between subpackages, and no I/O in `models` or `scoring`
 
 ## Three shapes of source, and which to copy from
 
-Every source fetches from one of three kinds of external place, and the
-codebase has one reference example of each:
+Every source fetches from one of three kinds of external place:
 
 | Shape                 | Reference                                                    | Stability                                                                 |
 | ---------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | JSON API                | [`sources/greenhouse.py`](src/jobsearcher/sources/greenhouse.py)       | A published contract. Fields are typed and named; a missing field is a genuine anomaly. |
 | RSS/XML feed             | [`sources/weworkremotely.py`](src/jobsearcher/sources/weworkremotely.py) | A published feed format, but not necessarily every field on every item (We Work Remotely truncates `<description>`, for instance). |
-| Scraped HTML page       | [`sources/freework.py`](src/jobsearcher/sources/freework.py)           | No contract at all. The site owes scrapers nothing and can change its markup at any time. |
+| Scraped HTML page       | _no live example_ — see below                                | No contract at all. The site owes scrapers nothing and can change its markup at any time. |
 
 Pick your reference by what you're pointed at, not by how similar the target
 site "feels" to one you already know:
@@ -97,23 +96,49 @@ site "feels" to one you already know:
   feeds to under-supply content compared to the full page (see We Work
   Remotely's truncated descriptions) more often than to omit structural
   fields outright.
-- **The only way to get the data is scraping rendered HTML** → copy
-  `freework.py`. This is the fragile case, and it's worth reading that
-  module's docstring in full before starting: selectors live as named
-  constants at the top of the module and nowhere else, every lookup that
-  can fail returns `None` instead of raising deep inside a parse tree, and
-  a page whose selectors no longer match anything must fail with a message
-  that says outright that the site's layout has probably changed — never
-  an `AttributeError` on `None`. `freework.py` uses BeautifulSoup
-  (`beautifulsoup4`, with the stdlib `html.parser` backend — no `lxml`) for
-  real CSS-selector support; if your source also needs HTML scraping, reuse
-  that dependency rather than adding another HTML parsing library.
+- **The only way to get the data is scraping rendered HTML** → this is the
+  fragile case. There is no live example in the tree today: the source that
+  used to fill this row, an HTML scrape of free-work.com, was removed (see
+  "Two things the free-work.com source taught" below), so read its last
+  version in the git history —
+  `git log --all -- src/jobsearcher/sources/freework.py` — for the
+  discipline this shape needs. In short: selectors live as named
+  constants at the top of the module and nowhere else; every lookup that can
+  fail returns `None` instead of raising deep inside a parse tree; and a
+  page whose selectors no longer match anything must fail with a message
+  that says outright that the site's layout has probably changed, never an
+  `AttributeError` on `None`. It used BeautifulSoup (`beautifulsoup4`, with
+  the stdlib `html.parser` backend — no `lxml`) for real CSS-selector
+  support; that dependency was dropped when the source was removed, so an
+  HTML-scraping source would be re-adding it — see "Adding a dependency".
 
 If a source doesn't cleanly fit one shape (e.g. an HTML page that embeds a
 JSON blob in a `<script>` tag), copy whichever reference dominates the
 *failure modes* you'll need to handle — a source that can fail because its
-markup moved should follow `freework.py`'s error-message discipline even if
-most of its fields come out of embedded JSON.
+markup moved should follow that error-message discipline even if most of
+its fields come out of embedded JSON.
+
+### Two things the free-work.com source taught
+
+That row lost its live example because the `freework` source was removed,
+and the removal is worth keeping the lesson from:
+
+- **A JSON API often hides behind a scraper.** `freework` started as an
+  HTML scrape of free-work.com's search-results page. free-work.com is a
+  single-page app: that page is rendered in the browser from a plain JSON
+  endpoint (`/api/job_postings`, a Hydra / API Platform collection), so the
+  scrape was re-deriving, one fragile selector at a time, data that was one
+  request away in typed and named form. Before parsing any HTML, open the
+  network tab and look for the JSON call that fills the page. The
+  scraped-HTML shape is a last resort, not a starting point.
+- **robots.txt is not the whole answer — read the terms of use too.**
+  free-work.com's `robots.txt` disallowed only `/login` and `/logout`, but
+  its [terms of use](https://www.free-work.com/fr/terms) reserve the API and
+  forbid extracting a substantial part of the database onto another medium.
+  That prohibition is about the extraction, not the transport — an HTML
+  scraper falls under it exactly as an API client would — so the source was
+  removed rather than ported to the JSON endpoint. This is step 1 below, and
+  it comes before choosing a shape or writing a line.
 
 ## Adding a new source
 
@@ -122,11 +147,23 @@ and normalizes them into `JobPosting`. It must not touch storage, scoring,
 or export — see "Target architecture" in [CLAUDE.md](CLAUDE.md).
 
 Adding one should never require changing an existing file *except*
-`sources/__init__.py` (step 4) and `src/jobsearcher/config.example.yaml`
-(step 5). The steps below use `sources/greenhouse.py` as the reference
+`sources/__init__.py` (step 5) and `src/jobsearcher/config.example.yaml`
+(step 6). The steps below use `sources/greenhouse.py` as the reference
 example.
 
-### 1. Create `src/jobsearcher/sources/<your_source>.py`
+### 1. Check robots.txt and the terms of use
+
+Before choosing a shape or writing a line, read `https://<site>/robots.txt`
+and the site's terms of use, and decide whether collecting from it is
+allowed at all. If the terms reserve the data or the API, forbid automated
+access, or forbid re-using a substantial part of the database, stop here —
+the source does not get written, whatever shape its data comes in.
+`robots.txt` being permissive is not enough on its own; the terms are where
+free-work.com's prohibition lived (see "Two things the free-work.com source
+taught" above). Record what you checked and what it said in the module
+docstring, so the next person does not have to redo it.
+
+### 2. Create `src/jobsearcher/sources/<your_source>.py`
 
 Subclass `Source` from [`sources/base.py`](src/jobsearcher/sources/base.py)
 and implement its two abstract methods:
@@ -154,7 +191,7 @@ class YourSource(Source):
 the name used in `config.yaml`'s `sources:` section — no registry file to
 edit by hand.
 
-### 2. Define a typed config model, inheriting `SourceHttpConfig`
+### 3. Define a typed config model, inheriting `SourceHttpConfig`
 
 `PluginConfig` (in `config.py`) is deliberately permissive (`extra="allow"`)
 because it's shared by every source and doesn't know which one it is. Once
@@ -184,7 +221,7 @@ class YourSource(Source):
             raise SourceConfigError(f"Invalid configuration for source {name!r}: {exc}") from exc
 ```
 
-### 3. Distinguish the two failure classes, and isolate failures at the right radius
+### 4. Distinguish the two failure classes, and isolate failures at the right radius
 
 `_request` raises one of two exceptions on an HTTP failure, and `fetch_raw`
 should raise the same distinction for failures it detects itself (e.g. an
@@ -219,7 +256,7 @@ and `failed` is `True` only when the source produced nothing usable at all
 docstring in [`sources/base.py`](src/jobsearcher/sources/base.py) for the
 full rationale.
 
-### 4. Register the module import
+### 5. Register the module import
 
 Add your module to
 [`sources/__init__.py`](src/jobsearcher/sources/__init__.py) so importing
@@ -229,7 +266,7 @@ Add your module to
 from jobsearcher.sources import your_source as your_source
 ```
 
-### 5. Add the config shape to `src/jobsearcher/config.example.yaml`
+### 6. Add the config shape to `src/jobsearcher/config.example.yaml`
 
 This file ships as package data (`jobsearcher init` writes it), so it lives
 inside the package, not at the repository root. Under `sources:`, following
@@ -242,7 +279,7 @@ sources:
     # your fields
 ```
 
-### 6. Write tests with recorded fixtures — no real HTTP calls
+### 7. Write tests with recorded fixtures — no real HTTP calls
 
 Tests must not hit the network (see CLAUDE.md's "Tests never touch the
 network"). Record a real response from your source into
@@ -280,13 +317,11 @@ See [`tests/test_sources_greenhouse.py`](tests/test_sources_greenhouse.py)
 and [`tests/fixtures/greenhouse_jobs.json`](tests/fixtures/greenhouse_jobs.json)
 for a complete JSON API example,
 [`tests/test_sources_weworkremotely.py`](tests/test_sources_weworkremotely.py)
-and its `tests/fixtures/weworkremotely_*` files for the RSS shape,
-[`tests/test_sources_freework.py`](tests/test_sources_freework.py) and its
-`tests/fixtures/freework_*.html` files for the HTML-scraping shape
-(including a fixture that specifically exercises the "layout has probably
-changed" path), and [`tests/test_sources_base.py`](tests/test_sources_base.py)
-for tests that exercise `Source`'s shared retry/backoff/rate-limit policy
-directly.
+and its `tests/fixtures/weworkremotely_*` files for the RSS shape, and
+[`tests/test_sources_base.py`](tests/test_sources_base.py) for tests that
+exercise `Source`'s shared retry/backoff/rate-limit policy directly. For the
+HTML-scraping shape, the removed `freework` source and its
+`tests/fixtures/freework_*.html` files are in the git history.
 
 ---
 
@@ -385,8 +420,8 @@ add one:
   style already in the history: a `type: summary` subject in the
   imperative mood, e.g. `feat: add Remotive source`, `fix: keep undetermined
   language visible in list`, `refactor: extract eligibility helpers`,
-  `docs: document the LLM scorer`, `test: cover the freework layout-change
-  path`, `chore: bump ruff`.
+  `docs: document the LLM scorer`, `test: cover the weworkremotely 403
+  fallback`, `chore: bump ruff`.
 - Keep the subject under ~72 characters. Use the body to explain *why*, not
   *what*, when the change isn't self-evident.
 - One logical change per commit. A new source, its `__init__.py` wiring, its
@@ -401,7 +436,9 @@ add one:
 ## Adding a dependency
 
 Don't, without asking the maintainer first and getting explicit approval —
-runtime, dev, or optional extra alike. The HTML-scraping stack is
-BeautifulSoup with the stdlib `html.parser` backend; RSS is
-`xml.etree.ElementTree`. Reach for what's already here before proposing
-something new.
+runtime, dev, or optional extra alike. Reach for what's already here before
+proposing something new: HTTP is `httpx`, RSS/XML is the stdlib
+`xml.etree.ElementTree`. There is no HTML-parsing dependency any more — the
+one source that needed BeautifulSoup was removed — so an HTML-scraping
+source would be adding one back, which is exactly the conversation to have
+first.
