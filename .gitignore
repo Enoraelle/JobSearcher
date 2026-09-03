@@ -24,6 +24,9 @@ htmlcov/
 
 # --- Data & secrets ---
 .env
+# Pipeline output (digests, exports); config.yaml points every output_path here.
+# The directory itself is kept (the file exporters don't create it).
+/output/
 *.db
 *.db-journal
 *.db-wal
